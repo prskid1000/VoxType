@@ -48,10 +48,35 @@ cd voicemode-windows
 
 ## Auto-Start (Task Scheduler)
 
+### Option 1: PowerShell script (recommended)
 ```powershell
 # Run as Administrator
 .\create-scheduled-tasks.ps1
 ```
+
+### Option 2: Manual setup via Task Scheduler GUI
+
+1. Open **Task Scheduler** (`taskschd.msc`)
+2. Click **Create Task** (not Basic Task)
+3. **General** tab:
+   - Name: `VoiceMode-Whisper-STT`
+   - Check "Run only when user is logged on"
+4. **Triggers** tab:
+   - New → Begin the task: "At log on"
+   - Specific user: your account
+5. **Actions** tab:
+   - New → Action: "Start a program"
+   - Program: `C:\Users\YOUR_USERNAME\.voicemode-windows\start-whisper-stt.bat`
+6. **Conditions** tab:
+   - Uncheck "Start only if on AC power"
+7. **Settings** tab:
+   - Uncheck "Stop the task if it runs longer than"
+   - Check "Allow task to be run on demand"
+8. Click OK
+
+Repeat for Kokoro TTS with:
+- Name: `VoiceMode-Kokoro-TTS`
+- Program: `C:\Users\YOUR_USERNAME\.voicemode-windows\start-kokoro-tts.bat`
 
 ## Usage in Claude Code
 

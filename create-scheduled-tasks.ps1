@@ -18,9 +18,9 @@ $ErrorActionPreference = "SilentlyContinue"
 $username = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
 # Whisper STT
-$whisperBat = Join-Path $InstallDir "start-whisper-stt.bat"
-if (Test-Path $whisperBat) {
-    $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$whisperBat`"" -WorkingDirectory $InstallDir
+$whisperVbs = Join-Path $InstallDir "start-whisper-stt.vbs"
+if (Test-Path $whisperVbs) {
+    $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$whisperVbs`"" -WorkingDirectory $InstallDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $username
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -41,9 +41,9 @@ if (Test-Path $whisperBat) {
 }
 
 # Kokoro TTS
-$kokoroBat = Join-Path $InstallDir "start-kokoro-tts.bat"
-if (Test-Path $kokoroBat) {
-    $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$kokoroBat`"" -WorkingDirectory $InstallDir
+$kokoroVbs = Join-Path $InstallDir "start-kokoro-tts.vbs"
+if (Test-Path $kokoroVbs) {
+    $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$kokoroVbs`"" -WorkingDirectory $InstallDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $username
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `

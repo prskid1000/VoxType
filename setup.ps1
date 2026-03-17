@@ -189,6 +189,13 @@ try:
 title Whisper STT Server (port $WhisperPort)
 "$sttVenv\Scripts\faster-whisper-server.exe" $WhisperModel --host 127.0.0.1 --port $WhisperPort
 "@ | Set-Content $whisperBat
+
+    # VBS launcher (no console window)
+    $whisperVbs = Join-Path $InstallDir "start-whisper-stt.vbs"
+    @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """$($whisperBat.Replace('\','\\'))""", 0, False
+"@ | Set-Content $whisperVbs
     Write-Ok "Whisper STT ready on port $WhisperPort"
 }
 
@@ -271,6 +278,13 @@ set WEB_PLAYER_PATH=%PROJECT_ROOT%\web
 cd /d %PROJECT_ROOT%
 "$ttsVenv\Scripts\uvicorn.exe" api.src.main:app --host 127.0.0.1 --port $KokoroPort
 "@ | Set-Content $kokoroBat
+
+    # VBS launcher (no console window)
+    $kokoroVbs = Join-Path $InstallDir "start-kokoro-tts.vbs"
+    @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run """$($kokoroBat.Replace('\','\\'))""", 0, False
+"@ | Set-Content $kokoroVbs
     Write-Ok "Kokoro TTS ready on port $KokoroPort"
 }
 

@@ -79,7 +79,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -Hidden
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
 Register-ScheduledTask -TaskName "VoiceMode-Whisper-STT" `
     -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
 
@@ -95,7 +95,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -Hidden
-$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Limited
 Register-ScheduledTask -TaskName "VoiceMode-Kokoro-TTS" `
     -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
 ```
@@ -121,7 +121,7 @@ schtasks /delete /tn VoiceMode-Kokoro-TTS /f
 | Setting | Value | Why |
 |---------|-------|-----|
 | `-Hidden` | true | No console window visible |
-| `-LogonType Interactive` | Run only when logged on | No password saved |
+| `-LogonType S4U` | Run whether logged on or not | No password stored |
 | `-ExecutionTimeLimit 0` | No time limit | Services run indefinitely |
 | `-AllowStartIfOnBatteries` | true | Works on laptop battery |
 | `-DontStopIfGoingOnBatteries` | true | Doesn't kill on unplug |

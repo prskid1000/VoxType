@@ -53,7 +53,7 @@ The setup script can be cloned to any drive/directory — it uses `$env:USERPROF
 
 ## Auto-Start (Task Scheduler)
 
-Services run hidden in the background with no console window. No password is saved — tasks run only when the user is logged on.
+Services run hidden in the background with no console window. Tasks run whether user is logged on or not — no password stored (S4U). If the PC was off at trigger time, services start as soon as the machine is available.
 
 ### Option 1: PowerShell script
 

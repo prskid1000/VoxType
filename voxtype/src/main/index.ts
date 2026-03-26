@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { startHotkeyListener, stopHotkeyListener, setHotkeyMode, setHotkeyCombo } from './hotkey';
-import { transcribe } from './stt';
+import { transcribe, preloadWhisper } from './stt';
 import { enhance, fetchModels, ensureLMStudio, preloadCurrentModel } from './llm';
 import { typeText } from './typer';
 import { createTray } from './tray';
@@ -178,13 +178,16 @@ app.whenReady().then(() => {
     return { ...settings };
   });
 
-  // Fetch LLM models + optional preload, then build tray
+  // Preload: warm up Whisper + LLM in parallel, then build tray
+  const whisperStartup = settings.preloadModel
+    ? preloadWhisper(settings.whisperUrl).catch(() => {})
+    : Promise.resolve();
   const llmStartup = settings.preloadModel
     ? ensureLMStudio(settings.lmStudioUrl)
         .then(() => fetchModels(settings.lmStudioUrl, settings.llmModel))
         .then(() => preloadCurrentModel(settings.lmStudioUrl))
     : Promise.resolve();
-  llmStartup
+  Promise.all([whisperStartup, llmStartup])
     .catch(() => {})
     .finally(() => {
       if (mainWindow) createTray(mainWindow, () => settings, (partial) => { Object.assign(settings, partial); saveSettings(settings); });

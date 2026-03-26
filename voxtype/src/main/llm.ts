@@ -249,8 +249,8 @@ function unloadCurrentModel(lmStudioUrl) {
     if (!model) return Promise.resolve();
     console.log(`[VoxType] Unloading LLM model: ${model}`);
     const base = new URL(lmStudioUrl);
-    const url = new URL(`/api/v0/models/unload`, `${base.protocol}//${base.host}`);
-    const payload = JSON.stringify({ model });
+    const url = new URL(`/api/v1/models/unload`, `${base.protocol}//${base.host}`);
+    const payload = JSON.stringify({ instance_id: model });
     return new Promise((resolve) => {
         const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
         const req = transport.request(url, {

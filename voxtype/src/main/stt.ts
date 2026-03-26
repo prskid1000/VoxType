@@ -25,12 +25,19 @@ function silentWav(): Buffer {
 }
 
 export async function unloadWhisper(whisperUrl: string): Promise<void> {
-  console.log('[VoxType] Unloading Whisper (killing faster-whisper-server)...');
+  console.log('[VoxType] Unloading Whisper (restarting server without model)...');
   try {
     execSync('taskkill /IM faster-whisper-server.exe /F', { timeout: 5000, stdio: 'ignore' });
     console.log('[VoxType] Whisper process killed');
   } catch {
-    console.log('[VoxType] Whisper process not running or already stopped');
+    console.log('[VoxType] Whisper process not running');
+  }
+  // Restart the scheduled task so the server is ready (model loads on first request)
+  try {
+    execSync('schtasks /Run /TN "VoiceMode-Whisper-STT"', { timeout: 5000, stdio: 'ignore' });
+    console.log('[VoxType] Whisper task restarted (no model loaded)');
+  } catch {
+    console.log('[VoxType] Could not restart Whisper task');
   }
 }
 

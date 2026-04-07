@@ -6,6 +6,7 @@ import { getEntries, clearHistory } from './history';
 import { WHISPER_MODELS, getCurrentModel, switchModel } from './whisper-model';
 import { FEATURED_VOICES, getCurrentVoice, setVoice } from './kokoro-voice';
 import { getAvailableModels, getCurrentLLMModel, setLLMModel, fetchModels, preloadCurrentModel, resetAutoUnloadTimer, stopAutoUnloadTimer } from './llm';
+import { getKokoroDevice, setKokoroDevice, getWhisperDevice, setWhisperDevice, type DeviceMode } from './device-switch';
 
 let tray: Tray | null = null;
 
@@ -104,6 +105,42 @@ export function createTray(
               rebuildMenu();
             },
           }));
+        })(),
+      },
+      {
+        label: 'Device (GPU/CPU)',
+        submenu: (() => {
+          const kokoroDev = getKokoroDevice();
+          const whisperDev = getWhisperDevice();
+          return [
+            { label: 'Kokoro TTS', enabled: false },
+            {
+              label: '  GPU',
+              type: 'radio' as const,
+              checked: kokoroDev === 'gpu',
+              click: async () => { await setKokoroDevice('gpu'); updateSettings({ kokoroDevice: 'gpu' }); rebuildMenu(); },
+            },
+            {
+              label: '  CPU',
+              type: 'radio' as const,
+              checked: kokoroDev === 'cpu',
+              click: async () => { await setKokoroDevice('cpu'); updateSettings({ kokoroDevice: 'cpu' }); rebuildMenu(); },
+            },
+            { type: 'separator' as const },
+            { label: 'Whisper STT', enabled: false },
+            {
+              label: '  GPU',
+              type: 'radio' as const,
+              checked: whisperDev === 'gpu',
+              click: async () => { await setWhisperDevice('gpu'); updateSettings({ whisperDevice: 'gpu' }); rebuildMenu(); },
+            },
+            {
+              label: '  CPU',
+              type: 'radio' as const,
+              checked: whisperDev === 'cpu',
+              click: async () => { await setWhisperDevice('cpu'); updateSettings({ whisperDevice: 'cpu' }); rebuildMenu(); },
+            },
+          ];
         })(),
       },
       { type: 'separator' },

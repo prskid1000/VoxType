@@ -1,21 +1,7 @@
-"use strict";
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.getAvailableModels = getAvailableModels;
-exports.getCurrentLLMModel = getCurrentLLMModel;
-exports.setLLMModel = setLLMModel;
-exports.ensureLMStudio = ensureLMStudio;
-exports.fetchModels = fetchModels;
-exports.preloadCurrentModel = preloadCurrentModel;
-exports.unloadCurrentModel = unloadCurrentModel;
-exports.resetAutoUnloadTimer = resetAutoUnloadTimer;
-exports.stopAutoUnloadTimer = stopAutoUnloadTimer;
-exports.enhance = enhance;
-const http_1 = __importDefault(require("http"));
-const https_1 = __importDefault(require("https"));
-const child_process_1 = require("child_process");
+import http from 'http';
+import https from 'https';
+import { execSync } from 'child_process';
+
 const SYSTEM_PROMPT = `You are a text cleaner. You receive a raw voice transcript and output ONLY the cleaned text. You are NOT a chatbot. You do NOT reply, answer questions, or add commentary.
 
 OUTPUT RULES:
@@ -79,12 +65,20 @@ If the speaker mixes languages (e.g., English + Hindi, English + Spanish), prese
 
 PARAGRAPH BREAKS:
 For longer transcripts (5+ sentences), group related sentences into paragraphs by topic. Insert a blank line between distinct topics or when the speaker shifts subject.`;
-let cachedModel = null;
-let availableModels = [];
+
+interface LLMModel {
+    id: string;
+    state?: string;
+}
+
+let cachedModel: string | null = null;
+let availableModels: LLMModel[] = [];
+
 // ─── LRU cache: skip LLM call for identical transcripts ─────────────
-const enhanceCache = new Map();
+const enhanceCache = new Map<string, string>();
 const CACHE_MAX = 50;
-function cacheGet(key) {
+
+function cacheGet(key: string): string | null {
     const val = enhanceCache.get(key);
     if (val) {
         enhanceCache.delete(key);
@@ -92,24 +86,29 @@ function cacheGet(key) {
     }
     return val || null;
 }
-function cacheSet(key, value) {
+
+function cacheSet(key: string, value: string): void {
     if (enhanceCache.size >= CACHE_MAX) {
         const oldest = enhanceCache.keys().next().value;
-        enhanceCache.delete(oldest);
+        if (oldest) enhanceCache.delete(oldest);
     }
     enhanceCache.set(key, value);
 }
-function getAvailableModels() {
+
+export function getAvailableModels(): LLMModel[] {
     return availableModels;
 }
-function getCurrentLLMModel() {
+
+export function getCurrentLLMModel(): string | null {
     return cachedModel;
 }
-function setLLMModel(modelId) {
+
+export function setLLMModel(modelId: string): void {
     cachedModel = modelId;
     console.log(`[VoxType] LLM model set to: ${modelId}`);
 }
-async function ensureLMStudio(lmStudioUrl) {
+
+export async function ensureLMStudio(lmStudioUrl: string): Promise<boolean> {
     // Phase 1: poll up to 5 times (LM Studio may already be starting)
     for (let i = 0; i < 5; i++) {
         if (await checkAlive(lmStudioUrl)) return true;
@@ -119,7 +118,7 @@ async function ensureLMStudio(lmStudioUrl) {
     // Phase 2: try starting via CLI
     console.log('[VoxType] LM Studio not running, attempting to start via lms CLI...');
     try {
-        (0, child_process_1.execSync)('lms server start', { timeout: 15000, stdio: 'ignore' });
+        execSync('lms server start', { timeout: 15000, stdio: 'ignore' });
     }
     catch (e) {
         console.log('[VoxType] Could not start LM Studio:', e);
@@ -135,10 +134,11 @@ async function ensureLMStudio(lmStudioUrl) {
     }
     return false;
 }
-function checkAlive(lmStudioUrl) {
+
+function checkAlive(lmStudioUrl: string): Promise<boolean> {
     const url = new URL('/v1/models', lmStudioUrl);
     return new Promise((resolve) => {
-        const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
+        const transport = url.protocol === 'https:' ? https : http;
         const req = transport.request(url, { method: 'GET', timeout: 3000 }, (res) => {
             res.resume();
             resolve(res.statusCode === 200);
@@ -148,7 +148,8 @@ function checkAlive(lmStudioUrl) {
         req.end();
     });
 }
-async function fetchModels(lmStudioUrl, savedModel) {
+
+export async function fetchModels(lmStudioUrl: string, savedModel?: string): Promise<LLMModel[]> {
     // Try v0 API first (all downloaded models with state)
     const v0 = await fetchV0Models(lmStudioUrl);
     if (v0.length > 0) {
@@ -182,20 +183,21 @@ async function fetchModels(lmStudioUrl, savedModel) {
     }
     return availableModels;
 }
-function fetchV0Models(lmStudioUrl) {
+
+function fetchV0Models(lmStudioUrl: string): Promise<LLMModel[]> {
     const base = new URL(lmStudioUrl);
     const url = new URL('/api/v1/models', `${base.protocol}//${base.host}`);
     return new Promise((resolve) => {
-        const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
+        const transport = url.protocol === 'https:' ? https : http;
         const req = transport.request(url, { method: 'GET', timeout: 5000 }, (res) => {
-            const chunks = [];
-            res.on('data', (chunk) => chunks.push(chunk));
+            const chunks: Buffer[] = [];
+            res.on('data', (chunk: Buffer) => chunks.push(chunk));
             res.on('end', () => {
                 try {
                     const json = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
                     const models = (json.data || [])
-                        .filter((m) => m.type !== 'embedding' && !m.id.includes('embed'))
-                        .map((m) => ({ id: m.id, state: (m.state || 'unknown') }));
+                        .filter((m: any) => m.type !== 'embedding' && !m.id.includes('embed'))
+                        .map((m: any) => ({ id: m.id, state: (m.state || 'unknown') }));
                     resolve(models);
                 }
                 catch {
@@ -208,17 +210,18 @@ function fetchV0Models(lmStudioUrl) {
         req.end();
     });
 }
-function fetchV1Models(lmStudioUrl) {
+
+function fetchV1Models(lmStudioUrl: string): Promise<string[]> {
     const url = new URL('/v1/models', lmStudioUrl);
     return new Promise((resolve) => {
-        const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
+        const transport = url.protocol === 'https:' ? https : http;
         const req = transport.request(url, { method: 'GET', timeout: 5000 }, (res) => {
-            const chunks = [];
-            res.on('data', (chunk) => chunks.push(chunk));
+            const chunks: Buffer[] = [];
+            res.on('data', (chunk: Buffer) => chunks.push(chunk));
             res.on('end', () => {
                 try {
                     const json = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-                    resolve((json.data || []).map((m) => m.id));
+                    resolve((json.data || []).map((m: any) => m.id));
                 }
                 catch {
                     resolve([]);
@@ -230,7 +233,8 @@ function fetchV1Models(lmStudioUrl) {
         req.end();
     });
 }
-function pickSmallest(modelIds) {
+
+function pickSmallest(modelIds: string[]): string {
     if (modelIds.length === 0)
         return 'qwen3.5-0.8b';
     const sizeRegex = /(\d+\.?\d*)\s*[bB]/;
@@ -241,10 +245,12 @@ function pickSmallest(modelIds) {
     });
     return sorted[0];
 }
+
 // ─── Auto-unload: unload LLM model after idle timeout ────────────────
-let autoUnloadTimeout = null;
-let autoUnloadCallback = null;
-function unloadCurrentModel(lmStudioUrl) {
+let autoUnloadTimeout: ReturnType<typeof setTimeout> | null = null;
+let autoUnloadCallback: (() => void) | null = null;
+
+export function unloadCurrentModel(lmStudioUrl: string): Promise<void> {
     const model = cachedModel;
     if (!model) return Promise.resolve();
     console.log(`[VoxType] Unloading LLM model: ${model}`);
@@ -252,7 +258,7 @@ function unloadCurrentModel(lmStudioUrl) {
     const url = new URL(`/api/v1/models/unload`, `${base.protocol}//${base.host}`);
     const payload = JSON.stringify({ instance_id: model });
     return new Promise((resolve) => {
-        const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
+        const transport = url.protocol === 'https:' ? https : http;
         const req = transport.request(url, {
             method: 'POST',
             timeout: 5000,
@@ -272,7 +278,8 @@ function unloadCurrentModel(lmStudioUrl) {
         req.end();
     });
 }
-function resetAutoUnloadTimer(minutes, lmStudioUrl, whisperUrl, onUnload) {
+
+export function resetAutoUnloadTimer(minutes: number, lmStudioUrl: string, whisperUrl?: string, onUnload?: () => void): void {
     if (autoUnloadTimeout) clearTimeout(autoUnloadTimeout);
     autoUnloadTimeout = null;
     if (!minutes || minutes <= 0) return;
@@ -284,17 +291,19 @@ function resetAutoUnloadTimer(minutes, lmStudioUrl, whisperUrl, onUnload) {
             try {
                 const { unloadWhisper } = require('./stt');
                 await unloadWhisper(whisperUrl);
-            } catch (e) {}
+            } catch (_e) {}
         }
         if (autoUnloadCallback) autoUnloadCallback();
     }, minutes * 60 * 1000);
 }
-function stopAutoUnloadTimer() {
+
+export function stopAutoUnloadTimer(): void {
     if (autoUnloadTimeout) clearTimeout(autoUnloadTimeout);
     autoUnloadTimeout = null;
 }
+
 // ─── Preload: send a dummy request to warm up the selected model ─────
-async function preloadCurrentModel(lmStudioUrl) {
+export async function preloadCurrentModel(lmStudioUrl: string): Promise<void> {
     const model = cachedModel || pickSmallest(availableModels.map(m => m.id));
     if (!model) return;
     console.log(`[VoxType] Preloading model: ${model}`);
@@ -308,12 +317,13 @@ async function preloadCurrentModel(lmStudioUrl) {
     try {
         await callLLM(url, payload);
         console.log(`[VoxType] Model preloaded: ${model}`);
-    } catch (e) {
-        console.log(`[VoxType] Model preload failed (non-fatal): ${e.message}`);
+    } catch (e: any) {
+        console.log(`[VoxType] Model preload failed (non-fatal): ${e?.message}`);
     }
 }
+
 // ─── Robust post-processing: strip LLM artifacts ────────────────────
-function cleanLLMOutput(content, originalTranscript) {
+function cleanLLMOutput(content: string, originalTranscript: string): string {
     content = content.trim();
     // Strip markdown fencing
     content = content.replace(/^```[\s\S]*?\n/, '').replace(/\n?```$/, '');
@@ -342,10 +352,11 @@ function cleanLLMOutput(content, originalTranscript) {
     }
     return content;
 }
+
 // ─── Single LLM call (extracted for retry logic) ────────────────────
-function callLLM(url, payload) {
+function callLLM(url: URL, payload: string): Promise<string> {
     return new Promise((resolve, reject) => {
-        const transport = url.protocol === 'https:' ? https_1.default : http_1.default;
+        const transport = url.protocol === 'https:' ? https : http;
         const req = transport.request(url, {
             method: 'POST',
             timeout: 30000,
@@ -354,8 +365,8 @@ function callLLM(url, payload) {
                 'Content-Length': Buffer.byteLength(payload),
             },
         }, (res) => {
-            const chunks = [];
-            res.on('data', (chunk) => chunks.push(chunk));
+            const chunks: Buffer[] = [];
+            res.on('data', (chunk: Buffer) => chunks.push(chunk));
             res.on('end', () => {
                 const raw = Buffer.concat(chunks).toString('utf-8');
                 if (res.statusCode !== 200) {
@@ -381,7 +392,8 @@ function callLLM(url, payload) {
         req.end();
     });
 }
-async function enhance(transcript, lmStudioUrl) {
+
+export async function enhance(transcript: string, lmStudioUrl: string): Promise<string> {
     if (!transcript.trim())
         return '';
     // Check cache — skip LLM entirely for repeated transcripts
@@ -410,7 +422,7 @@ async function enhance(transcript, lmStudioUrl) {
     });
     // Retry up to 2 times on transient failures
     const MAX_RETRIES = 2;
-    let lastError = null;
+    let lastError: any = null;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
             if (attempt > 0) {
@@ -422,9 +434,9 @@ async function enhance(transcript, lmStudioUrl) {
             cacheSet(transcript, result);
             return result;
         }
-        catch (e) {
+        catch (e: any) {
             lastError = e;
-            console.log(`[VoxType] LLM call failed (attempt ${attempt + 1}):`, e.message);
+            console.log(`[VoxType] LLM call failed (attempt ${attempt + 1}):`, e?.message);
         }
     }
     // All retries exhausted — gracefully return original instead of crashing

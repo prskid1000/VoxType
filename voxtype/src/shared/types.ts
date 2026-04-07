@@ -9,6 +9,8 @@ export interface HotkeyCombo {
   label: string; // human-readable, e.g. "Ctrl + Win"
 }
 
+export type DeviceMode = 'gpu' | 'cpu';
+
 export interface AppSettings {
   hotkeyMode: HotkeyMode;
   enhanceEnabled: boolean;
@@ -24,6 +26,8 @@ export interface AppSettings {
   llmModel: string;
   preloadModel: boolean;
   autoUnloadMinutes: number;
+  kokoroDevice: DeviceMode;
+  whisperDevice: DeviceMode;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -41,6 +45,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   llmModel: '',
   preloadModel: true,
   autoUnloadMinutes: 0,
+  kokoroDevice: 'gpu',
+  whisperDevice: 'gpu',
 };
 
 // IPC channel names

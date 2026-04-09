@@ -101,7 +101,7 @@ voicemode-windows/
 | Kokoro voice | 15 featured voices (writes to voicemode.env) |
 | LLM enhance | Toggle post-processing via LM Studio |
 | LLM model → Auto-unload after | Unload all models (LLM + Whisper + Kokoro) after idle (Disabled/5/10/15/30/60 min) |
-| LLM model → Preload on startup | Warm-up selected model at launch (sends dummy request) |
+| LLM model → Preload on startup | Warm-up Whisper + Kokoro + LLM at launch (parallel dummy requests) |
 | Append mode | Append text after cursor vs replace selection |
 | Auto-stop on silence | Stop recording after 2s silence |
 | Skip silence (VAD) | Skip sending empty audio to Whisper |
@@ -139,6 +139,7 @@ voicemode-windows/
 - **Preload sandboxing**: IPC constants inlined in preload.ts (can't import from shared modules in sandbox).
 - **Whisper model switch**: Rewrites .bat file + kills `faster-whisper-server` process + restarts scheduled task.
 - **Kokoro voice switch**: Writes to `~/.voicemode/voicemode.env` (VOICEMODE_VOICES var). No restart needed — picked up on next TTS call.
+- **Kokoro preload**: `preloadKokoro()` sends a short TTS request ("ok") at startup to warm up the model, runs in parallel with Whisper and LLM preload.
 
 ## Windows Patches (in apply-patches.py)
 

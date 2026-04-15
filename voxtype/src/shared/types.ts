@@ -2,11 +2,11 @@ export type PillState = 'idle' | 'recording' | 'processing' | 'enhancing' | 'typ
 
 export type HotkeyMode = 'hold' | 'toggle';
 
-// Two keycodes that must be held together to activate
+// One or two keycodes that must be held together to activate
 export interface HotkeyCombo {
   key1: number; // uiohook keycode
-  key2: number; // uiohook keycode
-  label: string; // human-readable, e.g. "Ctrl + Win"
+  key2?: number; // uiohook keycode (optional — omit for single-key hotkey)
+  label: string; // human-readable, e.g. "Ctrl + Win" or "F9"
 }
 
 export type DeviceMode = 'gpu' | 'cpu';

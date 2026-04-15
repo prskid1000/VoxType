@@ -47,7 +47,7 @@ Press your hotkey (default: **Ctrl+Win**), speak, release — text appears at yo
 
 - **Instant recording** — mic stream is pre-warmed at app startup (`getUserMedia` called once), eliminating the 3-second delay that normally occurs on first recording
 - **Hold or toggle mode** — "Hold to talk" records while you hold the hotkey; "Toggle" records on first press, stops on second press
-- **Custom hotkey** — capture any two-key combo (e.g. Ctrl+Win, Alt+Space) by clicking "Hotkey" in tray and pressing your keys
+- **Custom hotkey** — set a custom binding via the tray: (1) click "Hotkey: …" — menu closes and capture mode starts; (2) release every key so capture arms; (3) press your desired binding — one key alone (e.g. F9) or two keys together (e.g. Ctrl+Space); (4) release. Capture waits for a fully-released keyboard before listening, so tray/menu keystrokes don't leak in
 - **Whisper model switching** — select Tiny/Base/Small/Medium/Large v3 from tray; VoxType rewrites the `start-whisper-stt.bat` file with the new model name, kills the running `faster-whisper-server` process, and restarts the `VoiceMode-Whisper-STT` scheduled task — both VoxType dictation and Claude Code MCP use the same Whisper server
 - **Kokoro voice switching** — select from 15 curated voices; VoxType writes `VOICEMODE_VOICES=<voice_id>,alloy` to `~/.voicemode/voicemode.env` — the VoiceMode MCP server reads this file on each TTS call, so Claude Code's voice changes immediately without restart
 - **LLM enhancement** — after Whisper transcribes, the raw text is sent to LM Studio (`localhost:1234`) with an 11-rule system prompt + 10 examples to clean up fillers ("um", "like"), fix punctuation, format numbers/currency, and handle self-corrections — uses temperature 0 for deterministic output; auto-detects which model is loaded via `/v1/models`
@@ -80,7 +80,7 @@ Right-click the VoxType tray icon for full settings:
 |---------|------|--------------|
 | Hold to talk | Radio | Record audio while you hold the hotkey down. Release to stop and transcribe. |
 | Toggle on/off | Radio | First press starts recording, second press stops. Good for longer dictation. |
-| Hotkey | Click | Enters capture mode — press any two keys together to set as your hotkey. Shows current combo (e.g. "Ctrl + LWin"). |
+| Hotkey | Click | Click to enter capture mode (menu closes). Then release every key so capture arms, press your binding — one key alone (e.g. F9) or two keys together (e.g. Ctrl+Space) — and release. Capture waits for a fully-released keyboard before listening so menu accelerators don't leak in. Shows current binding (e.g. "Ctrl + LWin" or "F9"). |
 | Whisper model | Submenu | Switches the STT model. Rewrites `start-whisper-stt.bat`, kills the running Whisper process, restarts the scheduled task. Affects both VoxType and Claude Code MCP (same Whisper server). |
 | Kokoro voice | Submenu | Switches the TTS voice for Claude Code's VoiceMode MCP. Writes `VOICEMODE_VOICES=<id>,alloy` to `~/.voicemode/voicemode.env`. Takes effect on next MCP TTS call — no restart needed. |
 | LLM enhance | Toggle | Sends raw Whisper transcript to LM Studio (localhost:1234) for cleanup. Removes filler words, fixes punctuation, formats numbers. Disable for raw Whisper output. |

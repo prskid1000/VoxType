@@ -16,6 +16,7 @@ const heldKeys = new Set<number>();
 
 // Capture mode: next two keys become the new hotkey
 let captureResolve: ((combo: HotkeyCombo) => void) | null = null;
+let captureReady = false; // becomes true once all pre-capture keys are released
 const captureKeys: number[] = [];
 
 export function setHotkeyMode(m: HotkeyMode) {
@@ -34,6 +35,9 @@ export function setHotkeyCombo(c: HotkeyCombo) {
 export function captureHotkey(): Promise<HotkeyCombo> {
   return new Promise((resolve) => {
     captureKeys.length = 0;
+    // If the user triggered capture via keyboard (menu accelerator, Enter),
+    // some keys may still be held. Defer recording until everything is up.
+    captureReady = heldKeys.size === 0;
     captureResolve = resolve;
   });
 }
@@ -103,6 +107,8 @@ export function startHotkeyListener(cbs: HotkeyCallbacks) {
 
     // Capture mode
     if (captureResolve) {
+      // Ignore keydowns until all pre-capture keys have been released
+      if (!captureReady) return;
       if (!captureKeys.includes(key)) {
         captureKeys.push(key);
       }
@@ -118,8 +124,9 @@ export function startHotkeyListener(cbs: HotkeyCallbacks) {
       return;
     }
 
-    // Normal mode: check if both combo keys are held
-    if (heldKeys.has(normalize(combo.key1)) && heldKeys.has(normalize(combo.key2))) {
+    // Normal mode: check if all combo keys are held
+    const key2Held = combo.key2 === undefined || heldKeys.has(normalize(combo.key2));
+    if (heldKeys.has(normalize(combo.key1)) && key2Held) {
       if (mode === 'hold') {
         if (!isActive) {
           isActive = true;
@@ -141,9 +148,28 @@ export function startHotkeyListener(cbs: HotkeyCallbacks) {
     const key = normalize(e.keycode);
     heldKeys.delete(key);
 
-    // Hold mode: deactivate when either combo key is released
+    // Capture mode: once all pre-capture keys have been released, arm capture.
+    if (captureResolve && !captureReady && heldKeys.size === 0) {
+      captureReady = true;
+      return;
+    }
+
+    // Capture mode: if user released all keys with exactly one captured,
+    // finalize as a single-key hotkey.
+    if (captureResolve && captureReady && captureKeys.length === 1 && heldKeys.size === 0) {
+      const [k1] = captureKeys;
+      const result: HotkeyCombo = { key1: k1, label: keyName(k1) };
+      captureKeys.length = 0;
+      const resolve = captureResolve;
+      captureResolve = null;
+      resolve(result);
+      return;
+    }
+
+    // Hold mode: deactivate when any combo key is released
     if (mode === 'hold' && isActive) {
-      if (key === normalize(combo.key1) || key === normalize(combo.key2)) {
+      const k2 = combo.key2 === undefined ? -1 : normalize(combo.key2);
+      if (key === normalize(combo.key1) || key === k2) {
         isActive = false;
         callbacks?.onDeactivate();
       }

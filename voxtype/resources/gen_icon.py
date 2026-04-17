@@ -30,13 +30,7 @@ raw = b''
 for y in range(H):
     raw += b'\x00'
     for x in range(W):
-        if not in_rounded_rect(x, y, 3, 3, W - 4, H - 4, 14):
-            raw += TRANSPARENT
-            continue
-
-        # Purple gradient (#7c3aed → #6366f1)
-        t = ((x - 3) + (y - 3)) / ((W - 7) + (H - 7))
-        bg = rgba(lerp(124, 99, t), lerp(58, 102, t), lerp(237, 241, t))
+        bg = TRANSPARENT
 
         # Microphone capsule
         mc_x, mc_y = W / 2, H / 2 - 6

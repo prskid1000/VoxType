@@ -4,7 +4,6 @@ Sidebar sections:
   Dictation  — hotkey mode/combo, auto-stop, append, VAD
   Services   — Whisper + Kokoro enable/ports/models/device
   LLM        — enhance toggle, screen_context, proxy URL + model
-  About      — version, links, log location
 """
 from __future__ import annotations
 
@@ -33,7 +32,6 @@ SECTIONS = [
     ("dictation", "Dictation",  "🎙"),
     ("services",  "Services",   "⚙"),
     ("llm",       "LLM",        "🧠"),
-    ("about",     "About",      "ℹ"),
 ]
 
 
@@ -298,20 +296,6 @@ def _build_llm(window) -> QWidget:
     return scroll
 
 
-def _build_about() -> QWidget:
-    scroll, _, layout = _page()
-    card, body = _card("About", "VoxType (Python)")
-    from voxtype import __version__
-    body.addWidget(QLabel(f"Version: {__version__}"))
-    body.addWidget(QLabel(f"Data dir: {config.data_dir()}"))
-    body.addWidget(QLabel("LLM: telecode proxy (http://127.0.0.1:1235)"))
-    body.addWidget(QLabel("STT: faster-whisper-server (child process)"))
-    body.addWidget(QLabel("TTS: Kokoro-FastAPI (child process, optional)"))
-    layout.addWidget(card)
-    layout.addStretch(1)
-    return scroll
-
-
 # ── Window ───────────────────────────────────────────────────────────
 
 class SettingsWindow(QMainWindow):
@@ -381,7 +365,7 @@ class SettingsWindow(QMainWindow):
             elif sid == "llm":
                 w = _build_llm(self)
             else:
-                w = _build_about()
+                return
             self._pages[sid] = w
             self._stack.addWidget(w)
         self._stack.setCurrentWidget(self._pages[sid])

@@ -191,7 +191,6 @@ feel identical. Sidebar sections:
   Restart buttons
 - **LLM** — enhance / screen context toggles, proxy URL + model, Test
   Proxy Connection
-- **About** — version, data dir, sidecar info
 
 Tray submenus mirror the three upstream concerns (Whisper / Kokoro /
 LLM) with a status line and a Restart / Test Proxy action each.

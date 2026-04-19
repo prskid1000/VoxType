@@ -130,7 +130,6 @@ frameless dark window with a sidebar:
 - **Dictation** — hotkey mode, auto-stop on silence, VAD, append mode, save history
 - **Services** — Whisper + Kokoro enabled / port / model / device with Restart buttons
 - **LLM** — enhance on/off, screen context, proxy URL + model, Test Proxy Connection
-- **About** — version, data-dir path, sidecar info
 
 Every toggle writes through to `data/settings.json` atomically and
 calls `config.reload()` — effective on the next request. Port changes

@@ -363,8 +363,22 @@ def main() -> int:
     app.setApplicationName("VoxType")
     app.setQuitOnLastWindowClosed(False)
 
+    # Single-instance guard: if another VoxType is already running, ask
+    # it to surface its settings window and exit cleanly. Scheduled-task
+    # double-starts and manual `python -m voxtype` relaunches during
+    # development both end up here.
+    from voxtype.single_instance import is_already_running, InstanceServer
+    if is_already_running():
+        log.info("exiting — another instance handled activation")
+        return 0
+
     loop = _AsyncLoopThread()
     orch = Orchestrator(app, loop)
+
+    # Become the registered instance; incoming b"show" commands flip
+    # the settings window visible + raise.
+    _server = InstanceServer(on_show=orch.window.toggle)
+    app._voxtype_instance_server = _server  # keep alive
 
     # Ctrl+C on terminal runs
     signal.signal(signal.SIGINT, lambda *_: orch.quit())

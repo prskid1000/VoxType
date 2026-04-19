@@ -34,6 +34,7 @@ SECTIONS = [
     ("services",  "Services",   "⚙"),
     ("llm",       "LLM",        "🧠"),
     ("history",   "History",    "📜"),
+    ("logs",      "Logs",       "📋"),
 ]
 
 
@@ -369,7 +370,6 @@ def _build_history(window) -> QWidget:
     Paste buttons. Refreshes on every show (cheap — bounded to 500)."""
     from datetime import datetime
     from voxtype import history as _hist
-    from voxtype.typer import type_text
 
     scroll, content, layout = _page()
     card, body = _card("History", "Saved transcripts — newest first")
@@ -412,13 +412,16 @@ def _build_history(window) -> QWidget:
     final_view = QPlainTextEdit(); final_view.setReadOnly(True)
     rl.addWidget(final_view, 1)
 
-    # Action buttons under preview
+    # Action icons under preview — compact clipboard buttons only. The
+    # old "Paste At Cursor" shortcut is gone; re-pasting history at an
+    # arbitrary cursor is rare enough that the clipboard + Ctrl+V in the
+    # target app is the right UX.
     btn_row = QHBoxLayout()
-    copy_raw = QPushButton("Copy Raw"); copy_raw.setProperty("class", "ghost")
-    copy_final = QPushButton("Copy Final"); copy_final.setProperty("class", "ghost")
-    paste_btn = QPushButton("Paste Final At Cursor"); paste_btn.setProperty("class", "primary")
+    copy_raw = QPushButton("📋 Raw");   copy_raw.setProperty("class", "ghost")
+    copy_raw.setToolTip("Copy raw Whisper transcript to clipboard")
+    copy_final = QPushButton("📋 Final"); copy_final.setProperty("class", "ghost")
+    copy_final.setToolTip("Copy cleaned (LLM-enhanced) transcript to clipboard")
     btn_row.addWidget(copy_raw); btn_row.addWidget(copy_final); btn_row.addStretch(1)
-    btn_row.addWidget(paste_btn)
     rl.addLayout(btn_row)
 
     split.addWidget(right)
@@ -484,15 +487,6 @@ def _build_history(window) -> QWidget:
     def _on_copy_final():
         e = _current();  e and _copy(e.final or "")
 
-    def _on_paste():
-        e = _current()
-        if not e:
-            return
-        # type_text blocks (PowerShell SendKeys) — run off the Qt thread
-        import threading
-        threading.Thread(target=type_text, args=(e.final or e.raw or "", False),
-                         daemon=True).start()
-
     def _on_clear():
         from PySide6.QtWidgets import QMessageBox
         if QMessageBox.question(content, "Clear history",
@@ -506,9 +500,215 @@ def _build_history(window) -> QWidget:
     clear_btn.clicked.connect(_on_clear)
     copy_raw.clicked.connect(_on_copy_raw)
     copy_final.clicked.connect(_on_copy_final)
-    paste_btn.clicked.connect(_on_paste)
 
     refresh()
+    return scroll
+
+
+def _build_logs(window) -> QWidget:
+    """Live-tailing log viewer — same pattern as telecode.
+
+    File picker on top, QPlainTextEdit with QSyntaxHighlighter coloring
+    levels / tracebacks / URLs / timestamps. 1 s QTimer appends only the
+    new bytes since last poll; rotation detected via size-shrink → full
+    reload. Initial load capped at last 512 KB.
+    """
+    import os, subprocess, sys as _s
+    from PySide6.QtCore import QRegularExpression
+    from PySide6.QtGui import (
+        QTextCharFormat, QColor, QSyntaxHighlighter, QFont, QTextCursor,
+    )
+    from PySide6.QtWidgets import QPlainTextEdit
+    from voxtype import config as _cfg
+    from voxtype.qt_theme import (
+        ACCENT, WARN, ERR, OK, FG_DIM, FG_MUTE, BG_ELEV,
+    )
+
+    LOG_FILES = ["voxtype.log", "voxtype.log.prev"]
+    MAX_TAIL_BYTES = 512 * 1024
+
+    class LogHighlighter(QSyntaxHighlighter):
+        def __init__(self, doc):
+            super().__init__(doc)
+            def fmt(color: str, bold: bool = False) -> QTextCharFormat:
+                f = QTextCharFormat()
+                f.setForeground(QColor(color))
+                if bold:
+                    f.setFontWeight(QFont.Weight.DemiBold)
+                return f
+            self._rules = [
+                (QRegularExpression(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,\.]?\d*"), fmt(FG_MUTE)),
+                (QRegularExpression(r"\b(CRITICAL|FATAL)\b"), fmt("#ff9aa2", True)),
+                (QRegularExpression(r"\b(ERROR|ERR)\b"),      fmt(ERR, True)),
+                (QRegularExpression(r"\b(WARN(ING)?)\b"),     fmt(WARN, True)),
+                (QRegularExpression(r"\b(INFO)\b"),           fmt(ACCENT, True)),
+                (QRegularExpression(r"\b(DEBUG|TRACE)\b"),    fmt(FG_DIM, True)),
+                (QRegularExpression(r"\[[\w\.\-]+\]"),        fmt(OK)),
+                (QRegularExpression(r'^\s*File\s+".+?",\s+line\s+\d+.*$'), fmt("#b892ff")),
+                (QRegularExpression(r"^\s*Traceback \(most recent call last\):.*$"), fmt(ERR, True)),
+                (QRegularExpression(r"^\s*\w*(Error|Exception):.*$"), fmt(ERR)),
+                (QRegularExpression(r"https?://\S+"),         fmt(ACCENT)),
+                (QRegularExpression(r"\b\d+(\.\d+)?\b"),      fmt("#a8b3c7")),
+            ]
+
+        def highlightBlock(self, text: str) -> None:
+            for rx, f in self._rules:
+                it = rx.globalMatch(text)
+                while it.hasNext():
+                    m = it.next()
+                    self.setFormat(m.capturedStart(), m.capturedLength(), f)
+
+    scroll, _, layout = _page()
+    card, body = _card("Logs", "Live-tailing viewer · auto-refreshes")
+
+    top = QHBoxLayout(); top.setSpacing(8)
+    picker = QComboBox()
+    for n in LOG_FILES:
+        picker.addItem(n)
+    picker.setMinimumWidth(180)
+    size_lbl = QLabel("—"); size_lbl.setStyleSheet(f"color: {FG_MUTE}; font-size: 11px;")
+    follow_cb = QCheckBox("Follow"); follow_cb.setChecked(True)
+    clear_btn = QPushButton("Clear View"); clear_btn.setProperty("class", "ghost")
+    open_btn = QPushButton("Open Externally"); open_btn.setProperty("class", "ghost")
+    reveal_btn = QPushButton("Reveal Folder"); reveal_btn.setProperty("class", "ghost")
+    top.addWidget(picker); top.addWidget(size_lbl); top.addStretch(1)
+    top.addWidget(follow_cb); top.addSpacing(8)
+    top.addWidget(clear_btn); top.addWidget(open_btn); top.addWidget(reveal_btn)
+    body.addLayout(top)
+
+    viewer = QPlainTextEdit()
+    viewer.setReadOnly(True)
+    viewer.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+    viewer.setStyleSheet(
+        f"QPlainTextEdit {{ background: {BG_ELEV}; border: 1px solid {BORDER};"
+        f" border-radius: 6px; font-family: 'JetBrains Mono', Consolas, monospace;"
+        f" font-size: 11.5px; padding: 6px 8px; selection-background-color: {ACCENT};"
+        f" selection-color: #000; }}"
+    )
+    viewer.setMinimumHeight(440)
+    highlighter = LogHighlighter(viewer.document())
+    body.addWidget(viewer, 1)
+
+    card.setMinimumHeight(520)
+    layout.addWidget(card, 1)
+
+    state: dict = {"path": None, "pos": 0, "size": 0}
+
+    def _log_path(name: str):
+        return _cfg.data_dir() / name
+
+    def _human_bytes(n: int) -> str:
+        size = float(n)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024:
+                return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
+    def _load_initial(path):
+        viewer.clear()
+        if not path.exists():
+            viewer.setPlainText(f"[file not found: {path}]")
+            state["pos"] = 0; state["size"] = 0
+            size_lbl.setText("—")
+            return
+        size = path.stat().st_size
+        state["size"] = size
+        start = max(0, size - MAX_TAIL_BYTES)
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                if start > 0:
+                    f.readline()
+                data = f.read()
+                state["pos"] = f.tell()
+            text = data.decode("utf-8", errors="replace")
+            if start > 0:
+                text = f"… (showing last {_human_bytes(len(data))} of {_human_bytes(size)}) …\n" + text
+            viewer.setPlainText(text)
+            if follow_cb.isChecked():
+                viewer.moveCursor(QTextCursor.MoveOperation.End)
+            size_lbl.setText(_human_bytes(size))
+        except Exception as e:
+            viewer.setPlainText(f"[error reading {path}: {e}]")
+
+    def _tail():
+        path = state.get("path")
+        if path is None or not path.exists():
+            return
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if size < state["pos"]:
+            _load_initial(path); return
+        if size == state["pos"]:
+            return
+        try:
+            with open(path, "rb") as f:
+                f.seek(state["pos"])
+                data = f.read()
+                state["pos"] = f.tell()
+                state["size"] = size
+        except Exception:
+            return
+        if not data:
+            return
+        text = data.decode("utf-8", errors="replace")
+        at_bottom = follow_cb.isChecked() or (
+            viewer.verticalScrollBar().value() >= viewer.verticalScrollBar().maximum() - 2
+        )
+        cursor = viewer.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        size_lbl.setText(_human_bytes(size))
+        if at_bottom:
+            viewer.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _on_pick(idx: int):
+        name = picker.itemText(idx)
+        state["path"] = _log_path(name)
+        state["pos"] = 0
+        _load_initial(state["path"])
+
+    def _open_external():
+        p = state.get("path")
+        if not p:
+            return
+        try:
+            if _s.platform == "win32":
+                os.startfile(str(p))
+            elif _s.platform == "darwin":
+                subprocess.Popen(["open", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p)])
+        except Exception:
+            pass
+
+    def _reveal():
+        folder = _cfg.data_dir()
+        try:
+            if _s.platform == "win32":
+                subprocess.Popen(["explorer", str(folder)])
+            elif _s.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except Exception:
+            pass
+
+    picker.currentIndexChanged.connect(_on_pick)
+    clear_btn.clicked.connect(viewer.clear)
+    open_btn.clicked.connect(_open_external)
+    reveal_btn.clicked.connect(_reveal)
+    _on_pick(0)
+
+    from PySide6.QtCore import QTimer
+    timer = QTimer(scroll)
+    timer.setInterval(1000)
+    timer.timeout.connect(_tail)
+    timer.start()
+
     return scroll
 
 
@@ -582,6 +782,8 @@ class SettingsWindow(QMainWindow):
                 w = _build_llm(self)
             elif sid == "history":
                 w = _build_history(self)
+            elif sid == "logs":
+                w = _build_logs(self)
             else:
                 return
             self._pages[sid] = w

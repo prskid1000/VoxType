@@ -31,7 +31,12 @@ from voxtype.types import PillState
 log = logging.getLogger("voxtype.pill")
 
 ORB_SIZE = 44
-REC_W, REC_H = 90, 34
+REC_W, REC_H = 96, 36
+
+# Widget container must fit BOTH the orb (44x44) and the recording pill
+# (96x36); otherwise the taller idle orb gets clipped top-and-bottom.
+_W = max(REC_W, ORB_SIZE + 8)   # +8 for shadow breathing room
+_H = max(REC_H, ORB_SIZE + 8)
 
 
 _BG = {
@@ -65,9 +70,10 @@ class PillWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        # Fixed container size = max extent (recording pill). All states
-        # draw centered inside, so the widget never needs to resize.
-        self.setFixedSize(QSize(REC_W, REC_H))
+        # Container sized for the LARGER of the two shapes (orb vs
+        # recording pill) so neither gets clipped. Both draw centered
+        # inside so the widget never needs to resize.
+        self.setFixedSize(QSize(_W, _H))
 
         self._state: PillState = "idle"
         self._message: str = ""
@@ -141,7 +147,9 @@ class PillWindow(QWidget):
         is_recording = state == "recording"
 
         if is_recording:
-            rx, ry, rw, rh = 0, 0, REC_W, REC_H
+            rw, rh = REC_W, REC_H
+            rx = (W - rw) // 2
+            ry = (H - rh) // 2
         else:
             rw, rh = ORB_SIZE, ORB_SIZE
             rx = (W - rw) // 2

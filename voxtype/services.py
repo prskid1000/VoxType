@@ -210,6 +210,12 @@ def _spawn_whisper(cfg: WhisperConfig) -> subprocess.Popen:
     env = os.environ.copy()
     if cfg.device == "cpu":
         env["CUDA_VISIBLE_DEVICES"] = "-1"
+    # Force line-buffered stdout so POST /v1/audio/transcriptions lines
+    # appear in whisper.log immediately instead of after a 4-8 KB block
+    # (which can be never, on a fresh install that only serves a few
+    # requests). Without this the log looked empty while real requests
+    # were arriving and timing out.
+    env["PYTHONUNBUFFERED"] = "1"
     args = [str(_whisper_exe()), cfg.model, "--host", "127.0.0.1",
             "--port", str(cfg.port)]
     return subprocess.Popen(

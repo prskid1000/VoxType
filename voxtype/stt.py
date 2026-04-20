@@ -47,7 +47,7 @@ def silent_wav() -> bytes:
 
 async def transcribe(pcm: bytes, whisper_url: str,
                      language: str = "en",
-                     timeout: float = 15.0) -> str:
+                     timeout: float = 45.0) -> str:
     """POST the audio to /v1/audio/transcriptions. Returns the text;
     raises on non-200."""
     wav = pcm_to_wav(pcm)

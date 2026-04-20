@@ -401,20 +401,20 @@ def _sweep_port(name: ServiceName, port: int) -> None:
 
 # ── Spawn helpers ────────────────────────────────────────────────────
 
-def _nvidia_dll_dirs() -> list[str]:
-    """Directories inside stt-venv that hold the CUDA 12 runtime DLLs the
-    `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` pip wheels drop.
+def _nvidia_dll_dirs(venv: Path) -> list[str]:
+    """CUDA 12 runtime DLL dirs shipped by the `nvidia-*-cu12` pip wheels.
 
-    setup.ps1 pip-installs both into stt-venv, which puts
-    `cublas64_12.dll`, `cudnn*64_9.dll`, etc. under
-    `stt-venv\\Lib\\site-packages\\nvidia\\*\\bin`. Windows'
-    `LoadLibrary` doesn't search there by default — we have to prepend
-    them to the child's PATH, otherwise ctranslate2 fails its first
-    CUDA call with `Library cublas64_12.dll is not found`.
+    Those wheels drop DLLs under `<venv>/Lib/site-packages/nvidia/*/bin`.
+    Windows' `LoadLibrary` does NOT search there by default, so we
+    prepend them to the child's PATH on GPU spawns — otherwise the
+    first CUDA call crashes with "Library cublas64_12.dll is not
+    found" (ctranslate2 doesn't import the `nvidia` packages, so their
+    `__init__.py` `os.add_dll_directory` calls never fire).
 
-    Returns paths that exist; empty list on Linux or fresh install.
+    Safe no-op when the venv has no `nvidia/` dir (Kokoro's tts-venv
+    relies on torch/lib instead; PyTorch handles its own DLL search).
     """
-    nvidia_root = STT_VENV / "Lib" / "site-packages" / "nvidia"
+    nvidia_root = venv / "Lib" / "site-packages" / "nvidia"
     if not nvidia_root.exists():
         return []
     dirs: list[str] = []
@@ -425,17 +425,19 @@ def _nvidia_dll_dirs() -> list[str]:
     return dirs
 
 
+def _prepend_gpu_dll_dirs(env: dict, venv: Path) -> None:
+    """Prepend `<venv>` nvidia DLL dirs to env['PATH'] in place."""
+    dll_dirs = _nvidia_dll_dirs(venv)
+    if dll_dirs:
+        env["PATH"] = os.pathsep.join(dll_dirs + [env.get("PATH", "")])
+
+
 def _spawn_whisper(cfg: WhisperConfig) -> subprocess.Popen:
     env = os.environ.copy()
     if cfg.device == "cpu":
         env["CUDA_VISIBLE_DEVICES"] = "-1"
     else:
-        # Prepend NVIDIA DLL dirs so ctranslate2 can LoadLibrary the
-        # CUDA 12 runtime. Without this the child crashes on first
-        # inference (not at spawn) with a cublas-not-found error.
-        dll_dirs = _nvidia_dll_dirs()
-        if dll_dirs:
-            env["PATH"] = os.pathsep.join(dll_dirs + [env.get("PATH", "")])
+        _prepend_gpu_dll_dirs(env, STT_VENV)
     # Force line-buffered stdout so POST /v1/audio/transcriptions lines
     # appear in whisper.log immediately instead of after a 4-8 KB block
     # (which can be never, on a fresh install that only serves a few
@@ -465,6 +467,8 @@ def _spawn_kokoro(cfg: KokoroConfig) -> subprocess.Popen:
         "VOICES_DIR":      "src/voices/v1_0",
         "WEB_PLAYER_PATH": str(KOKORO_REPO / "web"),
     })
+    if cfg.device == "gpu":
+        _prepend_gpu_dll_dirs(env, TTS_VENV)
     args = [str(_uvicorn_exe()), "api.src.main:app",
             "--host", "127.0.0.1", "--port", str(cfg.port)]
     proc = subprocess.Popen(

@@ -287,14 +287,12 @@ async def enhance(
         "max_tokens": 4096,
         "response_format": _SCHEMA,
         # Transcript cleanup is a fixed-format rewrite — there's nothing
-        # for reasoning to figure out. Disable it at every layer so the
-        # model skips the <think>...</think> prefill and saves 5-10 s per
-        # enhance call. The proxy's reasoning_effort="none" picks up the
-        # model's "none" entry in reasoning_effort_map; chat_template_kwargs
-        # is a direct belt-and-braces pass-through to llama.cpp in case
-        # the map is empty.
+        # for reasoning to figure out. The proxy resolves this to whatever
+        # the active model's `reasoning_effort_map["none"]` declares
+        # (enable_thinking=false + thinking_budget_tokens=0 for Qwen, a
+        # different set of kwargs for other families). No Qwen-specific
+        # knobs hardcoded here.
         "reasoning_effort": "none",
-        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     last_exc: Exception | None = None

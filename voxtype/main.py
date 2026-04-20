@@ -223,15 +223,16 @@ class Orchestrator(QObject):
 
         final = raw
         if s.enhance_enabled:
-            # Skip enhance entirely if the proxy is known-unreachable from
-            # a previous request. Avoids blocking the pill on a full
-            # aiohttp-timeout round for every dictation when the proxy is
-            # down. State clears once a real request succeeds (enhance is
-            # still attempted on cold start where last_checked is False).
-            _st = llm.get_status()
-            if _st.last_checked and not _st.reachable:
-                log.info("enhance skipped — proxy last seen unreachable (%s)",
-                         _st.last_error or "—")
+            # Quick per-request health probe (3s GET /v1/models) so:
+            #   · when proxy is down, we skip enhance fast instead of
+            #     eating a full 30s × 3 retries aiohttp timeout round
+            #   · when proxy has recovered since last failure, we notice
+            #     on the very next dictation (no need to hit Test Proxy)
+            # The probe updates llm.get_status() as a side effect, so the
+            # tray LLM submenu flips to Ready/Unreachable automatically.
+            if not await llm.proxy_alive(s.proxy_url, timeout=3.0):
+                log.info("enhance skipped — proxy health check failed (%s)",
+                         llm.get_status().last_error or "—")
             else:
                 self.pill_state_req.emit("enhancing", "")
                 shot = None

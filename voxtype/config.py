@@ -78,13 +78,33 @@ def patch(path: str, value: Any) -> None:
     patch_settings() signature so UI code feels familiar.
 
     Only known top-level fields are accepted — unknown keys are ignored."""
+    from voxtype.types import HotkeyCombo
     s = load()
     keys = path.split(".")
     if keys[0] == "hotkey":
-        target = s.hotkey
-        for k in keys[1:-1]:
-            target = getattr(target, k)
-        setattr(target, keys[-1], value)
+        if len(keys) == 1:
+            # Full replacement: `config.patch("hotkey", {"key1": ..., ...})`.
+            # The old code did `setattr(s.hotkey, "hotkey", value)` which
+            # quietly set a phantom attribute on the HotkeyCombo dataclass;
+            # asdict() skipped it and every rebind was lost on reload.
+            if isinstance(value, dict):
+                s.hotkey = HotkeyCombo(
+                    key1=value.get("key1", "ctrl"),
+                    key2=value.get("key2"),
+                    label=value.get("label", ""),
+                )
+            elif isinstance(value, HotkeyCombo):
+                s.hotkey = value
+            else:
+                log.warning("patch: hotkey value must be dict/HotkeyCombo, got %r",
+                            type(value).__name__)
+                return
+        else:
+            # Sub-field write: `patch("hotkey.key1", "alt")` etc.
+            target = s.hotkey
+            for k in keys[1:-1]:
+                target = getattr(target, k)
+            setattr(target, keys[-1], value)
     elif len(keys) == 1 and hasattr(s, keys[0]):
         setattr(s, keys[0], value)
     else:

@@ -190,13 +190,19 @@ class Tray:
             self._kokoro_menu.setTitle("⬡ Kokoro: Disabled")
             self._kokoro_status.setText("disabled in settings")
 
-        # LLM
-        if self._llm_reachable is True:
-            self._llm_menu.setTitle(f"⬢ LLM: {settings.proxy_model}")
-            self._llm_status.setText(f"proxy {settings.proxy_url}")
-        elif self._llm_reachable is False:
-            self._llm_menu.setTitle("⬡ LLM: Unreachable")
-            self._llm_status.setText(f"no response from {settings.proxy_url}")
+        # LLM — hide the submenu entirely until a real request establishes
+        # reachability. No point staring at "Unknown" forever; Test Proxy
+        # remains available inside the Settings window if the user wants
+        # an explicit probe.
+        from voxtype import llm as _llm
+        status = _llm.get_status()
+        if not status.last_checked:
+            self._llm_menu.menuAction().setVisible(False)
         else:
-            self._llm_menu.setTitle("⬡ LLM: Unknown")
-            self._llm_status.setText(f"click Test Proxy · {settings.proxy_url}")
+            self._llm_menu.menuAction().setVisible(True)
+            if status.reachable:
+                self._llm_menu.setTitle(f"⬢ LLM: {settings.proxy_model}")
+                self._llm_status.setText(f"proxy {settings.proxy_url}")
+            else:
+                self._llm_menu.setTitle("⬡ LLM: Unreachable")
+                self._llm_status.setText(f"no response from {settings.proxy_url}")

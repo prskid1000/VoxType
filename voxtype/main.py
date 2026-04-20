@@ -223,20 +223,30 @@ class Orchestrator(QObject):
 
         final = raw
         if s.enhance_enabled:
-            self.pill_state_req.emit("enhancing", "")
-            shot = None
-            if s.screen_context:
-                # Screen capture is sync; run in executor so we don't stall loop
-                shot = await asyncio.get_event_loop().run_in_executor(
-                    None, capture_active_screen)
-            try:
-                final = await llm.enhance(
-                    raw, s.proxy_url, s.proxy_model,
-                    screenshot_jpeg_b64=shot,
-                )
-            except Exception as exc:
-                log.warning("enhance failed, using raw: %s", exc)
-                final = raw
+            # Skip enhance entirely if the proxy is known-unreachable from
+            # a previous request. Avoids blocking the pill on a full
+            # aiohttp-timeout round for every dictation when the proxy is
+            # down. State clears once a real request succeeds (enhance is
+            # still attempted on cold start where last_checked is False).
+            _st = llm.get_status()
+            if _st.last_checked and not _st.reachable:
+                log.info("enhance skipped — proxy last seen unreachable (%s)",
+                         _st.last_error or "—")
+            else:
+                self.pill_state_req.emit("enhancing", "")
+                shot = None
+                if s.screen_context:
+                    # Screen capture is sync; run in executor so we don't stall loop
+                    shot = await asyncio.get_event_loop().run_in_executor(
+                        None, capture_active_screen)
+                try:
+                    final = await llm.enhance(
+                        raw, s.proxy_url, s.proxy_model,
+                        screenshot_jpeg_b64=shot,
+                    )
+                except Exception as exc:
+                    log.warning("enhance failed, using raw: %s", exc)
+                    final = raw
 
         self.pill_state_req.emit("typing", "")
         try:

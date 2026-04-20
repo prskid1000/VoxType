@@ -286,6 +286,15 @@ async def enhance(
         "temperature": 0,
         "max_tokens": 4096,
         "response_format": _SCHEMA,
+        # Transcript cleanup is a fixed-format rewrite — there's nothing
+        # for reasoning to figure out. Disable it at every layer so the
+        # model skips the <think>...</think> prefill and saves 5-10 s per
+        # enhance call. The proxy's reasoning_effort="none" picks up the
+        # model's "none" entry in reasoning_effort_map; chat_template_kwargs
+        # is a direct belt-and-braces pass-through to llama.cpp in case
+        # the map is empty.
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     last_exc: Exception | None = None

@@ -144,17 +144,23 @@ Write-Host "    pip install (skips download if up-to-date)..." -ForegroundColor 
 & "$sttVenv\Scripts\pip.exe" install faster-whisper-server --no-cache-dir --quiet 2>&1 | Out-Null
 
 # CTranslate2 4.x (what faster-whisper ships with) needs CUDA 12 runtime -
-# specifically cublas64_12.dll + cudnn_ops_*.dll. The NVIDIA pip wheels drop
-# those DLLs straight into the venv's site-packages and CT2's DLL loader
-# finds them there automatically, so no system-wide CUDA install is
-# required. Skipped on CPU-only setups.
+# specifically cublas64_12.dll + cudnn_*64_9.dll. The NVIDIA pip wheels drop
+# those DLLs into stt-venv\Lib\site-packages\nvidia\*\bin. voxtype/process.py
+# prepends those bin dirs to the whisper child's PATH at spawn time so
+# LoadLibrary finds them (Windows' default DLL search does not). Skipped
+# on CPU-only setups.
 if ($GpuSupport) {
     Write-Host "    pip install (nvidia-cublas-cu12, nvidia-cudnn-cu12 - CUDA 12 runtime for Whisper GPU)..." -ForegroundColor DarkGray
     & "$sttVenv\Scripts\pip.exe" install "nvidia-cublas-cu12" "nvidia-cudnn-cu12" --no-cache-dir --quiet 2>&1 | Out-Null
-    if (-not (Test-Path "$sttVenv\Lib\site-packages\nvidia\cublas")) {
-        Warn "nvidia-cublas-cu12 install may have failed - Whisper will auto-fall-back to CPU"
+    $cublasDll = Join-Path $sttVenv "Lib\site-packages\nvidia\cublas\bin\cublas64_12.dll"
+    $cudnnDll  = Join-Path $sttVenv "Lib\site-packages\nvidia\cudnn\bin\cudnn64_9.dll"
+    $missing = @()
+    if (-not (Test-Path $cublasDll)) { $missing += "cublas64_12.dll" }
+    if (-not (Test-Path $cudnnDll))  { $missing += "cudnn64_9.dll" }
+    if ($missing.Count -gt 0) {
+        Warn ("CUDA runtime DLLs missing: {0} - Whisper will auto-fall-back to CPU" -f ($missing -join ", "))
     } else {
-        Ok "CUDA 12 runtime DLLs installed into stt-venv"
+        Ok "CUDA 12 runtime DLLs present in stt-venv (cublas64_12.dll + cudnn64_9.dll)"
     }
 }
 

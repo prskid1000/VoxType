@@ -401,10 +401,41 @@ def _sweep_port(name: ServiceName, port: int) -> None:
 
 # ── Spawn helpers ────────────────────────────────────────────────────
 
+def _nvidia_dll_dirs() -> list[str]:
+    """Directories inside stt-venv that hold the CUDA 12 runtime DLLs the
+    `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` pip wheels drop.
+
+    setup.ps1 pip-installs both into stt-venv, which puts
+    `cublas64_12.dll`, `cudnn*64_9.dll`, etc. under
+    `stt-venv\\Lib\\site-packages\\nvidia\\*\\bin`. Windows'
+    `LoadLibrary` doesn't search there by default — we have to prepend
+    them to the child's PATH, otherwise ctranslate2 fails its first
+    CUDA call with `Library cublas64_12.dll is not found`.
+
+    Returns paths that exist; empty list on Linux or fresh install.
+    """
+    nvidia_root = STT_VENV / "Lib" / "site-packages" / "nvidia"
+    if not nvidia_root.exists():
+        return []
+    dirs: list[str] = []
+    for pkg in nvidia_root.iterdir():
+        bin_dir = pkg / "bin"
+        if bin_dir.is_dir():
+            dirs.append(str(bin_dir))
+    return dirs
+
+
 def _spawn_whisper(cfg: WhisperConfig) -> subprocess.Popen:
     env = os.environ.copy()
     if cfg.device == "cpu":
         env["CUDA_VISIBLE_DEVICES"] = "-1"
+    else:
+        # Prepend NVIDIA DLL dirs so ctranslate2 can LoadLibrary the
+        # CUDA 12 runtime. Without this the child crashes on first
+        # inference (not at spawn) with a cublas-not-found error.
+        dll_dirs = _nvidia_dll_dirs()
+        if dll_dirs:
+            env["PATH"] = os.pathsep.join(dll_dirs + [env.get("PATH", "")])
     # Force line-buffered stdout so POST /v1/audio/transcriptions lines
     # appear in whisper.log immediately instead of after a 4-8 KB block
     # (which can be never, on a fresh install that only serves a few

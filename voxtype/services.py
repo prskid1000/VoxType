@@ -243,13 +243,18 @@ def _pids_listening_on(port: int) -> list[int]:
     return pids
 
 
-def _process_image(pid: int) -> str:
-    """Full executable path of a PID, or "" if unknown."""
+def _process_image(pid: int) -> tuple[str, str]:
+    """Return (exe_path, command_line) for a PID. Both are "" if unknown.
+
+    Checking the command line matters because a .exe under our venv is
+    often launched by the pyenv python.exe — so the owning process `Path`
+    points to pyenv, while the real sidecar identity is in argv[0]."""
     if os.name != "nt":
-        return ""
+        return "", ""
     ps = (
-        f"(Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue)."
-        "Path"
+        f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}' "
+        "-ErrorAction SilentlyContinue; "
+        "if ($p) { $p.ExecutablePath; '---'; $p.CommandLine }"
     )
     try:
         out = subprocess.run(
@@ -258,29 +263,35 @@ def _process_image(pid: int) -> str:
             creationflags=subprocess.CREATE_NO_WINDOW,
         ).stdout
     except Exception:
-        return ""
-    return out.strip()
+        return "", ""
+    parts = out.split("---", 1)
+    exe = parts[0].strip() if parts else ""
+    cmd = parts[1].strip() if len(parts) > 1 else ""
+    return exe, cmd
 
 
 def _sweep_port(name: ServiceName, port: int) -> None:
     """If an orphan from a previous VoxType run is holding `port`, kill it.
-    Only targets processes whose image lives under our sidecar venv, so a
-    misconfigured port collision with an unrelated app won't murder it."""
+    Only targets processes whose exe OR command line points inside our
+    sidecar venv, so a foreign app happening to use the same port doesn't
+    get murdered."""
     if not _port_in_use(port):
         return
     venv_root = STT_VENV if name == "whisper" else TTS_VENV
     venv_str = str(venv_root).lower()
     pids = _pids_listening_on(port)
     for pid in pids:
-        image = _process_image(pid).lower()
-        if image and image.startswith(venv_str):
+        exe, cmd = _process_image(pid)
+        exe_lc, cmd_lc = exe.lower(), cmd.lower()
+        is_ours = (exe_lc.startswith(venv_str) or venv_str in cmd_lc)
+        if is_ours:
             log.warning("[%s] port %d held by orphan PID %d (%s) — killing",
-                        name, port, pid, image)
+                        name, port, pid, exe or cmd or "unknown")
             _kill_tree(pid, force=True)
         else:
-            log.error("[%s] port %d in use by foreign PID %d (%s) — "
+            log.error("[%s] port %d in use by foreign PID %d (exe=%s cmd=%s) — "
                       "not killing; service will fail to bind",
-                      name, port, pid, image or "unknown")
+                      name, port, pid, exe or "?", cmd or "?")
     # Give the OS a moment to release the socket.
     for _ in range(20):
         if not _port_in_use(port):
@@ -370,6 +381,15 @@ async def _wait_ready(m: _Managed, url: str,
             log.warning("%s exited before becoming ready", name)
             return False
         if await _ping_once(url):
+            # Ping success is only meaningful if OUR child is what's
+            # serving the port. Re-poll after a short wait: if the child
+            # died within that window, the ping was actually hitting an
+            # orphan on the same port and we mustn't report "ready".
+            await asyncio.sleep(1.0)
+            if m.proc is None or m.proc.poll() is not None:
+                log.warning("%s died right after /health probe — "
+                            "another process on port", name)
+                return False
             log.info("%s ready after %.1fs (%d attempts)",
                      name, time.monotonic() - start, attempts)
             return True

@@ -206,3 +206,24 @@ class Tray:
             else:
                 self._llm_menu.setTitle("⬡ LLM: Unreachable")
                 self._llm_status.setText(f"no response from {settings.proxy_url}")
+
+        # Tray hover tooltip — a compact summary of what VoxType is doing
+        # right now so mousing over the icon actually tells you something.
+        bits: list[str] = [f"VoxType · hotkey {settings.hotkey.label}"]
+        if settings.whisper_enabled:
+            ws = process.get_status("whisper")
+            if ws.running and ws.ready:
+                bits.append(f"Whisper {settings.whisper_model} :{settings.whisper_port}")
+            elif ws.running:
+                bits.append("Whisper starting…")
+            else:
+                bits.append("Whisper stopped")
+        else:
+            bits.append("Whisper off")
+        if status.last_checked:
+            bits.append(f"LLM {'ok' if status.reachable else 'down'} · {settings.proxy_model}")
+        if settings.kokoro_enabled:
+            ks = process.get_status("kokoro")
+            if ks.running and ks.ready:
+                bits.append(f"Kokoro :{settings.kokoro_port}")
+        self.tray.setToolTip("\n".join(bits))

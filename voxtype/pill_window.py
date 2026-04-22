@@ -20,7 +20,7 @@ import logging
 import math
 from typing import Callable
 
-from PySide6.QtCore import Qt, QTimer, QPoint, Signal, QSize, QRectF
+from PySide6.QtCore import Qt, QTimer, QPoint, Signal, QSize, QRectF, QPointF
 from PySide6.QtGui import (
     QPainter, QColor, QBrush, QPen, QMouseEvent, QPainterPath,
 )
@@ -186,7 +186,7 @@ class PillWindow(QWidget):
             border = _BORDER.get(state, _BORDER["idle"])
             p.setBrush(QBrush(bg))
             p.setPen(QPen(border, 1.0))
-            radius = rh / 2
+            radius = 6.0
             p.drawRoundedRect(QRectF(rx, ry, rw, rh), radius, radius)
 
         cx = rx + rw / 2.0
@@ -208,22 +208,29 @@ class PillWindow(QWidget):
     # ── Glyphs ───────────────────────────────────────────────────────
 
     def _draw_idle(self, p: QPainter, cx: float, cy: float) -> None:
-        breathe = 0.80 + 0.20 * math.sin(self._phase / 25.0)
-        stroke = 3.0
-        border = QColor(120, 120, 120, 235)
-        pen = QPen(border, stroke)
-        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        inset = stroke / 2
-        p.drawRoundedRect(
-            QRectF(inset, inset, self.width() - 2 * inset, self.height() - 2 * inset),
-            6.0, 6.0,
-        )
+        breathe = 0.7 + 0.3 * math.sin(self._phase / 25.0)
+        
+        bar_count = 5
+        bar_width = 3.0
+        spacing = 2.0
+        
+        # Approximate heights of the 5 bars in the waveform
+        base_heights = [8.0, 12.0, 16.0, 12.0, 8.0]
+        
+        alpha = int(255 * 0.95 * breathe)
+        color = QColor(0, 0, 0, alpha)
+        
         p.setPen(Qt.PenStyle.NoPen)
-        core_r = 3.0 * breathe
-        p.setBrush(QBrush(border))
-        p.drawEllipse(QRectF(cx - core_r, cy - core_r, 2 * core_r, 2 * core_r))
+        p.setBrush(QBrush(color))
+        
+        total_width = bar_count * bar_width + (bar_count - 1) * spacing
+        start_x = cx - total_width / 2.0
+        
+        for i in range(bar_count):
+            h = base_heights[i] * breathe
+            x = start_x + i * (bar_width + spacing)
+            y = cy - h / 2.0
+            p.drawRoundedRect(QRectF(x, y, bar_width, h), 1.0, 1.0)
 
     def _draw_recording(self, p: QPainter,
                          rx: float, ry: float, rw: float, rh: float) -> None:

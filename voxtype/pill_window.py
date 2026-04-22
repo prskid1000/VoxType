@@ -22,7 +22,7 @@ from typing import Callable
 
 from PySide6.QtCore import Qt, QTimer, QPoint, Signal, QSize, QRectF, QPointF
 from PySide6.QtGui import (
-    QPainter, QColor, QBrush, QPen, QMouseEvent, QPainterPath,
+    QPainter, QColor, QBrush, QPen, QMouseEvent, QPainterPath, QLinearGradient,
 )
 from PySide6.QtWidgets import QWidget
 
@@ -208,23 +208,33 @@ class PillWindow(QWidget):
     # ── Glyphs ───────────────────────────────────────────────────────
 
     def _draw_idle(self, p: QPainter, cx: float, cy: float) -> None:
+        # Breathing oscillation (height/alpha)
         breathe = 0.7 + 0.3 * math.sin(self._phase / 25.0)
+        # Color oscillation (half-speed to toggle every other breath)
+        color_shift = math.sin(self._phase / 50.0)
         
         bar_count = 5
         bar_width = 3.0
         spacing = 2.0
-        
-        # Approximate heights of the 5 bars in the waveform
         base_heights = [8.0, 12.0, 16.0, 12.0, 8.0]
-        
-        alpha = int(255 * 0.95 * breathe)
-        color = QColor(0, 0, 0, alpha)
-        
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(color))
         
         total_width = bar_count * bar_width + (bar_count - 1) * spacing
         start_x = cx - total_width / 2.0
+        
+        # Calculate grey levels based on color_shift:
+        # Oscillates the average brightness so one pulse is light, the next is dark.
+        # Shift ranges from -60 to +60.
+        shift = 60 * color_shift
+        v1 = int(max(40, min(230, 160 + shift)))
+        v2 = int(max(20, min(210, 70 + shift)))
+        
+        alpha = int(255 * 0.95 * breathe)
+        grad = QLinearGradient(QPointF(start_x, cy), QPointF(start_x + total_width, cy))
+        grad.setColorAt(0.0, QColor(v1, v1, v1, alpha))
+        grad.setColorAt(1.0, QColor(v2, v2, v2, alpha))
+        
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(grad))
         
         for i in range(bar_count):
             h = base_heights[i] * breathe

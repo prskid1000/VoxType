@@ -1,25 +1,38 @@
-"""Direct in-process TTS inference via ONNX Runtime.
+"""Direct in-process TTS inference via sherpa-onnx (ONNX Runtime).
 
-Pass an `.onnx` + `.onnx.json` pair to the engine and it does the rest.
-Any compatible TTS model works (the loaded file IS the voice).
+Same library as the STT engine — one dependency, both engines. The
+Kokoro multilingual model (Chinese + English, 103 speakers, 82M params,
+~395 MB) is the built-in default. Any sherpa-onnx-compatible Kokoro
+export works.
 
-Model source: local file path OR a HuggingFace repo ID, which is auto-
-downloaded via `huggingface_hub` on first load.
+Model source: a local model directory OR a HuggingFace repo ID, which
+is auto-downloaded via `huggingface_hub.snapshot_download()` on first
+load. Expected layout (matches `csukuangfj/kokoro-multi-lang-v1_1`):
 
-CPU / GPU switching is purely an ONNX Runtime concern — `device='cuda'`
-falls back to CPU automatically if onnxruntime-gpu isn't usable.
+    <model>/model.onnx
+    <model>/voices.bin
+    <model>/tokens.txt
+    <model>/lexicon-us-en.txt   (optional, per-language)
+    <model>/lexicon-gb-en.txt
+    <model>/lexicon-zh.txt
+    <model>/dict/               (optional)
+    <model>/espeak-ng-data/     (optional)
 
-Lifecycle, status callbacks and idle unload mirror stt_engine.py so
-the tray + settings UI use the same code paths.
+CPU / GPU switching is purely an ONNX Runtime concern — sherpa-onnx
+takes a `provider` string. `device='cuda'` falls back to CPU
+automatically if onnxruntime-gpu isn't usable.
+
+Speaker selection: the `voice` field in the OpenAI /v1/audio/speech
+request is parsed as an integer speaker ID (0-102 for the default
+Kokoro multi-lang model). Out-of-range falls back to `tts_speaker`
+from settings.
 """
 from __future__ import annotations
 
 import asyncio
 import gc
 import io
-import json
 import logging
-import struct
 import threading
 import time
 import wave
@@ -31,7 +44,15 @@ from typing import Any, Callable
 log = logging.getLogger("voxtype.tts_engine")
 
 
-# ── Status type (mirrors stt_engine.EngineStatus) ────────────────────
+# ── Default model ────────────────────────────────────────────────────
+# Kokoro multi-lang v1.1: best balance of latest + popular + multi-voice
+# + multilingual + small in mid-2026. 103 speakers, Chinese + English
+# (GB / US), ~82M params, ONNX-exported by csukuangfj and shipped in
+# the sherpa-onnx TTS samples gallery.
+DEFAULT_MODEL = "csukuangfj/kokoro-multi-lang-v1_1"
+
+
+# ── Status type ──────────────────────────────────────────────────────
 
 @dataclass
 class TTSStatus:
@@ -49,8 +70,7 @@ class TTSEngine:
     """Singleton — call `get_engine()`. Thread-safe."""
 
     def __init__(self) -> None:
-        self._voice: Any = None         # PiperVoice wrapper (when piper-tts is installed)
-        self._session: Any = None       # raw onnxruntime.InferenceSession (fallback path)
+        self._tts: Any = None
         self._model_lock = asyncio.Lock()
         self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxtype-tts")
         self._loaded_key: tuple | None = None
@@ -59,15 +79,14 @@ class TTSEngine:
         self._last_used = 0.0
         self._idle_unload_sec = 0
         self._idle_watch_started = False
-        self._sample_rate = 22050     # overridden when the model loads
+        self._sample_rate = 24000     # sherpa-onnx Kokoro default
+        self._num_speakers = 0
 
         # Current settings.
         self._model_path = ""
         self._device = "cpu"
         self._speaker = 0
         self._length_scale = 1.0
-        self._noise_scale = 0.667
-        self._noise_w = 0.8
 
     # ── Listener wiring ──────────────────────────────────────────────
 
@@ -91,16 +110,18 @@ class TTSEngine:
 
     # ── Configuration ────────────────────────────────────────────────
 
+    def _effective_model(self) -> str:
+        """Empty setting → use the built-in default."""
+        return self._model_path or DEFAULT_MODEL
+
     def _key(self) -> tuple:
-        return (self._model_path, self._device)
+        return (self._effective_model(), self._device)
 
     async def configure(self, s) -> None:
         self._model_path = str(getattr(s, "tts_model_path", "") or "")
         self._device = getattr(s, "tts_device", "cpu")
         self._speaker = int(getattr(s, "tts_speaker", 0))
         self._length_scale = float(getattr(s, "tts_length_scale", 1.0))
-        self._noise_scale = float(getattr(s, "tts_noise_scale", 0.667))
-        self._noise_w = float(getattr(s, "tts_noise_w", 0.8))
         self._idle_unload_sec = int(getattr(s, "tts_idle_unload_sec", 0))
 
         if self._loaded_key is not None and self._loaded_key != self._key():
@@ -110,45 +131,35 @@ class TTSEngine:
     # ── Load / unload ────────────────────────────────────────────────
 
     async def ensure_loaded(self) -> None:
-        if not self._model_path:
-            raise RuntimeError("tts_model_path is empty — set it in Settings")
-        if self._voice is not None and self._loaded_key == self._key():
+        if self._tts is not None and self._loaded_key == self._key():
             return
         async with self._model_lock:
-            if self._voice is not None and self._loaded_key == self._key():
+            if self._tts is not None and self._loaded_key == self._key():
                 return
-            if self._voice is not None:
+            if self._tts is not None:
                 await self._do_unload_locked()
             await self._do_load_locked()
 
     async def _do_load_locked(self) -> None:
-        # Resolve model path: local file/dir OR HuggingFace repo ID.
-        try:
-            resolved = _resolve_tts_model(self._model_path)
-        except Exception as exc:
-            self._status.last_error = str(exc)
-            self._notify()
-            raise
-        log.info("tts loading model=%s device=%s", resolved, self._device)
-        path = resolved
+        model = self._effective_model()
+        log.info("tts loading model=%s device=%s", model, self._device)
         self._status.last_error = ""
         self._status.running = False
         self._status.ready = False
         self._notify()
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(self._exec, self._build_voice, str(path))
+            await loop.run_in_executor(self._exec, self._build_tts, model)
             self._loaded_key = self._key()
             self._status.running = True
             self._status.ready = True
             self._last_used = time.monotonic()
-            log.info("tts ready (sample_rate=%d)", self._sample_rate)
+            log.info("tts ready (%d speakers, %d Hz)", self._num_speakers, self._sample_rate)
             self._notify()
             self._ensure_idle_watcher()
         except Exception as exc:
             log.error("tts load failed: %s", exc)
-            self._voice = None
-            self._session = None
+            self._tts = None
             self._loaded_key = None
             self._status.running = False
             self._status.ready = False
@@ -156,54 +167,58 @@ class TTSEngine:
             self._notify()
             raise
 
-    def _providers(self) -> list[str]:
-        """ONNX Runtime execution providers, ordered for natural CPU fallback."""
-        if self._device == "cuda":
-            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        return ["CPUExecutionProvider"]
+    def _build_tts(self, model_path: str) -> None:
+        """Sync — runs in the executor. Resolves the model (local OR HF)
+        and builds a sherpa-onnx OfflineTts."""
+        import sherpa_onnx
+        model_dir = resolve_model_dir(model_path)
 
-    def _build_voice(self, path: str) -> None:
-        """Sync — runs in the executor. Loads the voice via `piper-tts`
-        if available (bundles phonemization); falls back to raw
-        onnxruntime if not."""
-        providers = self._providers()
-        try:
-            from piper import PiperVoice  # type: ignore
-            self._voice = PiperVoice.load(path, use_cuda=(self._device == "cuda"))
-            cfg_path = Path(path).with_suffix(Path(path).suffix + ".json")
-            if cfg_path.exists():
-                try:
-                    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                    self._sample_rate = int(cfg.get("audio", {}).get("sample_rate", 22050))
-                except Exception:
-                    pass
-            return
-        except ImportError:
-            log.info("piper-tts not installed — falling back to raw onnxruntime")
-        # Raw onnxruntime path. Limited: only supports models whose JSON
-        # config bundles the phoneme map AND callers pass phoneme IDs.
-        # For now we just open the session and load the JSON; phonemization
-        # without piper-tts is out of scope (users should install piper-tts).
-        import onnxruntime as ort
-        self._session = ort.InferenceSession(path, providers=providers)
-        cfg_path = Path(path).with_suffix(Path(path).suffix + ".json")
-        if cfg_path.exists():
-            try:
-                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                self._sample_rate = int(cfg.get("audio", {}).get("sample_rate", 22050))
-            except Exception:
-                pass
+        model_onnx = _pick(model_dir, ("model.onnx", "model.int8.onnx"))
+        voices_bin = _pick(model_dir, ("voices.bin",))
+        tokens = _pick(model_dir, ("tokens.txt",))
+        if not (model_onnx and voices_bin and tokens):
+            raise RuntimeError(
+                f"Kokoro TTS files not found under {model_dir} — expected "
+                "model.onnx + voices.bin + tokens.txt"
+            )
+
+        # Optional lexicons / dict / espeak-ng-data: pass when present.
+        lexicons = sorted(model_dir.glob("lexicon-*.txt"))
+        lexicon_arg = ",".join(str(p) for p in lexicons) if lexicons else ""
+        dict_dir = model_dir / "dict"
+        data_dir = model_dir / "espeak-ng-data"
+
+        provider = "cuda" if self._device == "cuda" else "cpu"
+        config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
+                    model=str(model_onnx),
+                    voices=str(voices_bin),
+                    tokens=str(tokens),
+                    lexicon=lexicon_arg,
+                    data_dir=str(data_dir) if data_dir.is_dir() else "",
+                    dict_dir=str(dict_dir) if dict_dir.is_dir() else "",
+                    length_scale=self._length_scale,
+                ),
+                num_threads=2,
+                provider=provider,
+            ),
+            max_num_sentences=1,
+        )
+        self._tts = sherpa_onnx.OfflineTts(config)
+        # sherpa-onnx exposes sample_rate + num_speakers post-init.
+        self._sample_rate = int(getattr(self._tts, "sample_rate", 24000))
+        self._num_speakers = int(getattr(self._tts, "num_speakers", 0))
 
     async def unload(self) -> None:
         async with self._model_lock:
             await self._do_unload_locked()
 
     async def _do_unload_locked(self) -> None:
-        if self._voice is None and self._session is None:
+        if self._tts is None:
             return
         log.info("tts unloading")
-        self._voice = None
-        self._session = None
+        self._tts = None
         self._loaded_key = None
         self._status.running = False
         self._status.ready = False
@@ -213,50 +228,53 @@ class TTSEngine:
     # ── Synthesis ────────────────────────────────────────────────────
 
     async def synthesize(self, text: str,
-                          voice: str | None = None,
+                          voice: str | int | None = None,
                           speed: float | None = None) -> bytes:
-        """Return WAV bytes (16-bit mono) for `text`. `voice` is accepted
-        for OpenAI-shape API compatibility but ignored — the loaded
-        model IS the voice."""
+        """Return WAV bytes (16-bit mono, sherpa-onnx Kokoro sample rate).
+
+        `voice`: speaker ID. Accepts an int directly, or a string that
+            parses to int. Out-of-range / unparseable → falls back to
+            `tts_speaker` from settings.
+        `speed`: OpenAI-shape (1.0 = normal). Maps to sherpa-onnx
+            `speed` arg directly (sherpa uses the same convention).
+        """
         await self.ensure_loaded()
         self._last_used = time.monotonic()
-        # OpenAI speed (1.0 = normal) → length_scale (inverse).
-        if speed is None or speed <= 0:
-            length_scale = self._length_scale
-        else:
-            length_scale = self._length_scale / float(speed)
+        sid = self._resolve_sid(voice)
+        spd = float(speed) if (speed and speed > 0) else 1.0
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
-            self._exec, self._do_synthesize, text, length_scale,
+            self._exec, self._do_synthesize, text, sid, spd,
         )
 
-    def _do_synthesize(self, text: str, length_scale: float) -> bytes:
+    def _resolve_sid(self, voice) -> int:
+        if voice is None or voice == "":
+            return self._speaker
+        try:
+            sid = int(voice)
+        except (TypeError, ValueError):
+            return self._speaker
+        if self._num_speakers > 0 and not (0 <= sid < self._num_speakers):
+            log.warning("voice id %d out of range [0, %d) — using %d",
+                        sid, self._num_speakers, self._speaker)
+            return self._speaker
+        return sid
+
+    def _do_synthesize(self, text: str, sid: int, speed: float) -> bytes:
         """Sync — runs in the executor. Returns WAV bytes."""
-        if self._voice is not None:
-            buf = io.BytesIO()
-            with wave.open(buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(self._sample_rate)
-                # piper-tts API has varied across versions — support both
-                # the "synthesize" generator method and the
-                # "synthesize_to_wav_file" file-writer fallback.
-                synth_args = dict(
-                    speaker_id=self._speaker,
-                    length_scale=length_scale,
-                    noise_scale=self._noise_scale,
-                    noise_w=self._noise_w,
-                )
-                try:
-                    self._voice.synthesize(text, wf, **synth_args)
-                except TypeError:
-                    # Older API: passes the wave file as positional.
-                    self._voice.synthesize(text, wav_file=wf, **synth_args)
-            return buf.getvalue()
-        raise RuntimeError(
-            "tts model loaded via raw onnxruntime — install `piper-tts` "
-            "for text synthesis support"
-        )
+        import numpy as np
+        result = self._tts.generate(text, sid=sid, speed=speed)
+        samples = np.asarray(result.samples, dtype=np.float32)
+        # float32 [-1, 1] → int16
+        np.clip(samples, -1.0, 1.0, out=samples)
+        int16 = (samples * 32767.0).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(result.sample_rate or self._sample_rate))
+            wf.writeframes(int16.tobytes())
+        return buf.getvalue()
 
     # ── Idle unload watcher ──────────────────────────────────────────
 
@@ -269,7 +287,7 @@ class TTSEngine:
             INTERVAL = 30.0
             while True:
                 time.sleep(INTERVAL)
-                if self._voice is None and self._session is None:
+                if self._tts is None:
                     continue
                 if self._idle_unload_sec <= 0:
                     continue
@@ -287,41 +305,48 @@ class TTSEngine:
                          name="voxtype-tts-idle").start()
 
 
-# ── Model resolver ───────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────
 
-def _resolve_tts_model(model_path: str) -> Path:
+def _pick(directory: Path, candidates: tuple[str, ...]) -> Path | None:
+    """Return the first existing candidate file inside `directory`.
+    Walks one level deep so models packed in a sub-folder still work."""
+    for name in candidates:
+        p = directory / name
+        if p.exists():
+            return p
+    for sub in directory.iterdir() if directory.is_dir() else []:
+        if sub.is_dir():
+            for name in candidates:
+                p = sub / name
+                if p.exists():
+                    return p
+    return None
+
+
+def resolve_model_dir(model_path: str) -> Path:
     """Accept either a local path or a HuggingFace repo ID.
 
-    Returns a local `Path` to the `.onnx` file. If the input is an HF
-    repo ID, snapshot_download fetches it to the HF cache and we pick
-    the first `.onnx` file inside.
+    Returns a local `Path` to the model directory:
+      - Local file/dir exists → return its dir (or parent)
+      - Looks like `org/repo` → snapshot_download via huggingface_hub
+        and return the cached dir
     """
     if not model_path:
-        raise RuntimeError("tts_model_path is empty — set it in Settings")
+        model_path = DEFAULT_MODEL
     p = Path(model_path).expanduser()
     if p.exists():
-        if p.is_file():
-            return p
-        # Directory → first .onnx inside.
-        for child in p.rglob("*.onnx"):
-            if not child.name.endswith(".onnx.json"):
-                return child
-        raise RuntimeError(f"no .onnx file under {p}")
-    # Looks like an HF repo? (contains '/', not absolute)
+        return p if p.is_dir() else p.parent
     if "/" in model_path and not p.is_absolute():
         try:
             from huggingface_hub import snapshot_download
         except ImportError as exc:
             raise RuntimeError(
                 "huggingface_hub not installed — `pip install huggingface_hub` "
-                "or enter a local path to the .onnx file"
+                "or enter a local path to the model directory"
             ) from exc
         log.info("tts downloading HF repo %s …", model_path)
-        cached = Path(snapshot_download(repo_id=model_path))
-        for child in cached.rglob("*.onnx"):
-            if not child.name.endswith(".onnx.json"):
-                return child
-        raise RuntimeError(f"no .onnx file in HF repo {model_path}")
+        cached = snapshot_download(repo_id=model_path)
+        return Path(cached)
     raise RuntimeError(f"model not found: {model_path}")
 
 

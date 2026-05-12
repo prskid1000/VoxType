@@ -4,10 +4,10 @@
     VoxType Setup — local voice dictation overlay for Windows.
 .DESCRIPTION
     Installs the VoxType UI Python deps (PySide6 + pynput + sherpa-onnx +
-    piper-tts + huggingface_hub + …) into a single venv, and registers a
-    scheduled task `VoxType` that auto-starts at logon. STT and TTS run
-    in-process via ONNX Runtime — no separate child processes, no extra
-    venvs.
+    huggingface_hub + …) into a single venv, and registers a scheduled
+    task `VoxType` that auto-starts at logon. STT and TTS both run
+    in-process via sherpa-onnx (ONNX Runtime) — no separate child
+    processes, no extra venvs.
 
     External clients (telecode, MCP tools) reach VoxType through the
     embedded OpenAI-compatible HTTP server on port 6600 (configurable).
@@ -16,15 +16,11 @@
     Where everything lives. Defaults to ~/.voxtype.
 .PARAMETER GpuSupport
     Swap CPU `onnxruntime` for `onnxruntime-gpu` so device='cuda' works
-    for STT and TTS. Set to $false for CPU-only.
-.PARAMETER SkipTTS
-    Skip the TTS install (piper-tts). Dictation still works; the TTS engine
-    just refuses to load.
+    for both STT and TTS. Set to $false for CPU-only.
 #>
 param(
     [string]$InstallDir   = "$env:USERPROFILE\.voxtype",
-    [bool]  $GpuSupport   = $true,
-    [switch]$SkipTTS
+    [bool]  $GpuSupport   = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -118,28 +114,18 @@ if (-not (Test-Path $voxPython)) {
     & $pythonExe -m venv $voxVenv
 }
 
-Write-Host "    pip install core deps (PySide6, pynput, sounddevice, aiohttp, sherpa-onnx, piper-tts, huggingface_hub)..." -ForegroundColor DarkGray
+Write-Host "    pip install core deps (PySide6, pynput, sounddevice, aiohttp, sherpa-onnx, huggingface_hub)..." -ForegroundColor DarkGray
 & $voxPython -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
 & "$voxVenv\Scripts\pip.exe" install -r "$voxTypeDir\requirements.txt" --no-cache-dir --quiet 2>&1 | Out-Null
 
 if (-not (Test-Path "$voxVenv\Lib\site-packages\PySide6")) { Fail "VoxType UI pip install failed" }
 if (-not (Test-Path "$voxVenv\Lib\site-packages\sherpa_onnx")) { Fail "sherpa-onnx install failed" }
-Ok "Core deps installed (UI + STT engine)"
+Ok "Core deps installed (UI + STT + TTS via sherpa-onnx)"
 
-if ($SkipTTS) {
-    Warn "Skipping TTS install (per -SkipTTS) — TTS engine will refuse to load"
-} else {
-    if (-not (Test-Path "$voxVenv\Lib\site-packages\piper")) {
-        Warn "piper-tts didn't install — TTS engine will refuse to load until you `pip install piper-tts` manually"
-    } else {
-        Ok "TTS engine deps installed (piper-tts)"
-    }
-}
-
-# GPU: both STT (sherpa-onnx) and TTS (piper-tts) use ONNX Runtime under
-# the hood. The CPU `onnxruntime` wheel is pulled in transitively; swap
-# it for `onnxruntime-gpu` so device='cuda' actually lands on the GPU.
-# Falls back to CPU automatically if CUDA isn't usable.
+# GPU: sherpa-onnx uses ONNX Runtime under the hood for both engines.
+# Swap the CPU `onnxruntime` wheel (pulled in transitively) for
+# `onnxruntime-gpu` so device='cuda' actually lands on the GPU. Falls
+# back to CPU automatically at runtime if CUDA isn't usable.
 if ($GpuSupport) {
     Write-Host "    pip install onnxruntime-gpu (replaces CPU onnxruntime for GPU inference)..." -ForegroundColor DarkGray
     & "$voxVenv\Scripts\pip.exe" uninstall -y onnxruntime --quiet 2>&1 | Out-Null

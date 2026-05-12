@@ -35,6 +35,15 @@ from typing import Any, Callable
 log = logging.getLogger("voxtype.stt_engine")
 
 
+# ── Default model ────────────────────────────────────────────────────
+# Whisper Large V3 Turbo (sherpa-onnx export): the multilingual STT
+# default sweet spot in 2026. Distilled from large-v3, ~6× faster than
+# large-v3 while staying within ~1-2% WER, ~809M params, 99+ languages.
+# Popular + latest + multilingual + fast. Ships in csukuangfj's well-
+# maintained sherpa-onnx repos.
+DEFAULT_MODEL = "csukuangfj/sherpa-onnx-whisper-turbo"
+
+
 # ── Status type ──────────────────────────────────────────────────────
 
 @dataclass
@@ -93,7 +102,7 @@ class STTEngine:
     # ── Configuration ────────────────────────────────────────────────
 
     def _key(self) -> tuple:
-        return (self._model_path, self._device)
+        return (self._effective_model(), self._device)
 
     async def configure(self, s) -> None:
         """Apply settings from `AppSettings`. If the key changed and a
@@ -109,9 +118,12 @@ class STTEngine:
 
     # ── Load / unload ────────────────────────────────────────────────
 
+    def _effective_model(self) -> str:
+        """Empty setting → use the built-in default (matches docgraph's
+        reranker pattern: empty = use default)."""
+        return self._model_path or DEFAULT_MODEL
+
     async def ensure_loaded(self) -> None:
-        if not self._model_path:
-            raise RuntimeError("stt_model_path is empty — set it in Settings")
         if self._recognizer is not None and self._loaded_key == self._key():
             return
         async with self._model_lock:
@@ -122,14 +134,15 @@ class STTEngine:
             await self._do_load_locked()
 
     async def _do_load_locked(self) -> None:
-        log.info("stt loading model=%s device=%s", self._model_path, self._device)
+        model = self._effective_model()
+        log.info("stt loading model=%s device=%s", model, self._device)
         self._status.last_error = ""
         self._status.running = False
         self._status.ready = False
         self._notify()
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(self._exec, self._build_recognizer, self._model_path)
+            await loop.run_in_executor(self._exec, self._build_recognizer, model)
             self._loaded_key = self._key()
             self._status.running = True
             self._status.ready = True
@@ -265,7 +278,9 @@ def resolve_model_dir(model_path: str) -> Path:
         `huggingface_hub`. The cached dir is returned.
     """
     if not model_path:
-        raise RuntimeError("stt_model_path is empty — set it in Settings")
+        # Should never happen — STTEngine._effective_model() substitutes
+        # DEFAULT_MODEL before calling. Guard anyway.
+        model_path = DEFAULT_MODEL
     p = Path(model_path).expanduser()
     if p.exists():
         return p if p.is_dir() else p.parent

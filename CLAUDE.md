@@ -47,7 +47,7 @@ voxtype/
     ├── history.py             # Append-only JSON
     │
     ├── stt_engine.py          # In-process STT — sherpa-onnx + HF auto-download
-    ├── tts_engine.py          # In-process TTS — onnxruntime/piper-tts + HF auto-download
+    ├── tts_engine.py          # In-process TTS — sherpa-onnx Kokoro + HF auto-download
     ├── server.py              # Embedded aiohttp /v1/audio/* server
     ├── stt.py                 # Shim → delegates to stt_engine
     ├── llm.py                 # OpenAI-shape POST to telecode proxy
@@ -112,8 +112,13 @@ text = await eng.transcribe(pcm)    # inference in single-thread executor
 await eng.unload()                  # release model, gc.collect
 ```
 
-STT uses `sherpa-onnx` (any sherpa-compatible Whisper / Paraformer /
-Zipformer export). TTS uses `piper-tts` on top of `onnxruntime`.
+Both engines run on `sherpa-onnx` (a thin wrapper over `onnxruntime`).
+One dependency, both engines. STT supports any sherpa-onnx Whisper /
+Paraformer / Zipformer / SenseVoice export. TTS supports Kokoro / VITS-
+Piper / Matcha-TTS exports. Defaults: Whisper Large V3 Turbo for STT
+(`csukuangfj/sherpa-onnx-whisper-turbo`, multilingual) and Kokoro
+multi-lang v1.1 for TTS (`csukuangfj/kokoro-multi-lang-v1_1`, 103
+voices, English + Chinese).
 
 Each engine:
 - Accepts either a **local path** or a **HuggingFace repo ID** as the
@@ -206,15 +211,16 @@ takes ~10 s.
 
 1. **Prereqs**: Python 3.10+, git, ffmpeg (warn-only), GPU detection
 2. **Single venv**: `voxtype-venv/` + `pip install -r voxtype/requirements.txt`
-   (PySide6, pynput, sounddevice, aiohttp, sherpa-onnx, piper-tts,
-   huggingface_hub)
+   (PySide6, pynput, sounddevice, aiohttp, sherpa-onnx, huggingface_hub)
 3. **GPU runtime** (if `-GpuSupport $true`): swap CPU `onnxruntime` for
    `onnxruntime-gpu` so both STT and TTS land on CUDA when `device='cuda'`
 4. **Scheduled task** `VoxType`: runs `pythonw.exe -m voxtype` at logon
-5. **Seed settings**: `data/settings.json` with AppSettings defaults
-   (user picks STT/TTS models from the settings window)
+5. **Seed settings**: `data/settings.json` with AppSettings defaults.
+   Both engines have built-in defaults (`csukuangfj/sherpa-onnx-whisper-turbo`
+   for STT, `csukuangfj/kokoro-multi-lang-v1_1` for TTS) so dictation
+   works out of the box — settings are only for overrides.
 
-Parameters: `-GpuSupport`, `-SkipTTS`, `-InstallDir`.
+Parameters: `-GpuSupport`, `-InstallDir`.
 
 ## What changed in the in-process refactor
 
@@ -228,7 +234,8 @@ Removed:
 - Subprocess lifecycle in `process.py` — `_spawn_whisper`, `_spawn_kokoro`,
   `_wait_ready`, `_drain`, `_force_cpu_restart`, GPU-broken stdout sniffer
 - HTTP client in `stt.py` (replaced by direct engine delegate)
-- `faster-whisper` dependency (replaced by `sherpa-onnx`)
+- `faster-whisper` dependency (STT now via `sherpa-onnx`)
+- `piper-tts` dependency (TTS now via `sherpa-onnx` Kokoro)
 
 Added:
 - `voxtype/stt_engine.py` — `STTEngine` singleton, sherpa-onnx + HF auto-download

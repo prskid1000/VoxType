@@ -174,13 +174,15 @@ class Tray:
     def _refresh(self) -> None:
         settings = config.load()
 
-        # STT
+        # STT — empty model_path falls back to the engine's built-in
+        # default, so Load/Reload are always enabled when STT is on.
         if settings.stt_enabled:
             s = process.get_status("stt")
+            from voxtype.stt_engine import DEFAULT_MODEL as _STT_DEFAULT
+            chosen = settings.stt_model_path or _STT_DEFAULT
             if s.ready:
                 self._stt_menu.setTitle("⬢ STT: Ready")
-                model_short = (settings.stt_model_path.split("\\")[-1].split("/")[-1]
-                                or "(no model)")
+                model_short = chosen.split("\\")[-1].split("/")[-1]
                 self._stt_status.setText(f"{model_short} · {settings.stt_device}")
             elif s.running:
                 self._stt_menu.setTitle("⬡ STT: Loading")
@@ -188,9 +190,9 @@ class Tray:
             else:
                 self._stt_menu.setTitle("⬡ STT: Unloaded")
                 self._stt_status.setText(s.last_error or "not loaded")
-            self._stt_start.setEnabled(not s.ready and bool(settings.stt_model_path))
+            self._stt_start.setEnabled(not s.ready)
             self._stt_stop.setEnabled(s.ready)
-            self._stt_restart.setEnabled(bool(settings.stt_model_path))
+            self._stt_restart.setEnabled(True)
         else:
             self._stt_menu.setTitle("⬡ STT: Disabled")
             self._stt_status.setText("disabled in settings")
@@ -198,13 +200,15 @@ class Tray:
             self._stt_stop.setEnabled(False)
             self._stt_restart.setEnabled(False)
 
-        # TTS
+        # TTS — empty model_path falls back to the engine's built-in
+        # default, same as STT.
         if settings.tts_enabled:
             s = process.get_status("tts")
+            from voxtype.tts_engine import DEFAULT_MODEL as _TTS_DEFAULT
+            chosen = settings.tts_model_path or _TTS_DEFAULT
             if s.ready:
                 self._tts_menu.setTitle("⬢ TTS: Ready")
-                model_name = (settings.tts_model_path.split("\\")[-1].split("/")[-1]
-                              or "(no model)")
+                model_name = chosen.split("\\")[-1].split("/")[-1]
                 self._tts_status.setText(f"{model_name} · {settings.tts_device}")
             elif s.running:
                 self._tts_menu.setTitle("⬡ TTS: Loading")
@@ -212,9 +216,9 @@ class Tray:
             else:
                 self._tts_menu.setTitle("⬡ TTS: Unloaded")
                 self._tts_status.setText(s.last_error or "not loaded")
-            self._tts_start.setEnabled(not s.ready and bool(settings.tts_model_path))
+            self._tts_start.setEnabled(not s.ready)
             self._tts_stop.setEnabled(s.ready)
-            self._tts_restart.setEnabled(bool(settings.tts_model_path))
+            self._tts_restart.setEnabled(True)
         else:
             self._tts_menu.setTitle("⬡ TTS: Disabled")
             self._tts_status.setText("disabled in settings")

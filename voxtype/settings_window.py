@@ -419,21 +419,23 @@ def _hf_check_button(line_edit: QLineEdit, status_lbl: QLabel) -> QPushButton:
     return btn
 
 
-def _model_row(path_field: str, placeholder: str = "") -> QWidget:
+def _model_row(path_field: str, default_model: str = "") -> QWidget:
     """Model path row: text field (HF repo OR local path) + Browse + Check + status pill.
 
-    Used by both STT and TTS — they share the same UX:
-      - Text accepts an HF repo ID (e.g. `csukuangfj/sherpa-onnx-whisper-small`)
-        or a local file/folder path.
-      - Browse opens a file dialog for picking an `.onnx` locally.
-      - Check verifies the value (file exists locally, or HF repo lookup).
+    Same pattern as docgraph's reranker model row:
+      - Empty field → engine uses `default_model` automatically.
+      - Placeholder text shows the default so users know what they'll get.
+      - Free text accepts an HF repo ID (e.g.
+        `csukuangfj/sherpa-onnx-whisper-small.en`) or a local path.
+      - Browse picks a local `.onnx` file.
+      - Check verifies the value (local stat first, then HF API).
     """
     from PySide6.QtWidgets import QFileDialog
     w = QWidget()
     h = QHBoxLayout(w); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
     le = QLineEdit()
     le.setText(str(getattr(config.load(), path_field, "")))
-    le.setPlaceholderText(placeholder)
+    le.setPlaceholderText(f"{default_model}  (default)" if default_model else "")
     le.editingFinished.connect(lambda: config.patch(path_field, le.text()))
 
     browse = QPushButton("Browse…")
@@ -490,11 +492,12 @@ def _build_services(window) -> QWidget:
         "Unload the STT model after N seconds of no transcribe "
         "requests. 0 = never. Next request reloads it automatically."),
         _spin_idle("stt_idle_unload_sec")))
+    from voxtype.stt_engine import DEFAULT_MODEL as _STT_DEFAULT
     s_body.addWidget(_row(_label("Model",
-        "HuggingFace repo ID (auto-downloaded) or local path to an ONNX "
-        "model directory. Any sherpa-onnx compatible export works."),
-        _model_row("stt_model_path",
-                    "csukuangfj/sherpa-onnx-whisper-small  (or C:\\path\\to\\model)")))
+        "HuggingFace repo ID (auto-downloaded) or local path to a "
+        "sherpa-onnx model directory. Empty = use the built-in default "
+        "shown as placeholder."),
+        _model_row("stt_model_path", _STT_DEFAULT)))
     s_body.addWidget(_row(_label("Device",
         "CUDA falls back to CPU automatically if onnxruntime-gpu isn't available."),
         _combo("stt_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))
@@ -517,11 +520,13 @@ def _build_services(window) -> QWidget:
         "Unload the TTS model after N seconds of no synthesise calls. "
         "0 = never."),
         _spin_idle("tts_idle_unload_sec")))
+    from voxtype.tts_engine import DEFAULT_MODEL as _TTS_DEFAULT
     t_body.addWidget(_row(_label("Model",
-        "HuggingFace repo ID (auto-downloaded) or local path to an ONNX "
-        "voice file. The `.onnx.json` config sibling is auto-located."),
-        _model_row("tts_model_path",
-                    "rhasspy/piper-voices  (or C:\\path\\to\\voice.onnx)")))
+        "HuggingFace repo ID, repo+file path (e.g. "
+        "`rhasspy/piper-voices/en/.../voice.onnx`), or a local .onnx file. "
+        "The `.onnx.json` config sibling is auto-located. Empty = use the "
+        "built-in default shown as placeholder."),
+        _model_row("tts_model_path", _TTS_DEFAULT)))
     t_body.addWidget(_row(_label("Device",
         "CUDA falls back to CPU automatically if onnxruntime-gpu isn't available."),
         _combo("tts_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))

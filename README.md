@@ -31,8 +31,10 @@ cd "$env:USERPROFILE\.voxtype"
 
 1. Verify **Python 3.10+**, **git**, **ffmpeg** (optional), GPU support
 2. Create `voxtype-venv/` and `pip install -r voxtype/requirements.txt`
-   (PySide6, pynput, sounddevice, aiohttp, **sherpa-onnx**, **piper-tts**,
-   **huggingface_hub**, …) into one venv
+   (PySide6, pynput, sounddevice, aiohttp, **sherpa-onnx**,
+   **huggingface_hub**, …) into one venv. `sherpa-onnx` powers BOTH the
+   STT and TTS engines — one library, both engines, one consistent
+   CPU/CUDA story.
 3. If `-GpuSupport $true` (default): swap CPU `onnxruntime` for
    `onnxruntime-gpu` so `device='cuda'` lands on the GPU for both STT
    and TTS (falls back to CPU automatically if CUDA isn't usable)
@@ -48,7 +50,6 @@ release.
 
 ```powershell
 .\setup.ps1                            # full install (STT + TTS, GPU)
-.\setup.ps1 -SkipTTS                   # no TTS deps
 .\setup.ps1 -GpuSupport $false         # CPU-only ONNX Runtime
 .\setup.ps1 -InstallDir "D:\voxtype"   # custom location
 ```
@@ -57,22 +58,31 @@ Re-running `setup.ps1` is idempotent.
 
 ### Picking models
 
-Both STT and TTS are **off until you point them at a model** (open
-Settings → Services). For each engine you can enter either a local
-path or a **HuggingFace repo ID** — repo IDs auto-download to the HF
-cache on first load.
+Both engines ship with **sensible defaults** — leave the model field
+empty in Settings → Services and the engine downloads the built-in
+default on first use. Override by typing a HuggingFace repo ID or a
+local path.
 
-**STT examples:**
-- `csukuangfj/sherpa-onnx-whisper-tiny.en` — small + fast
-- `csukuangfj/sherpa-onnx-whisper-small` — better quality
-- `C:\models\my-whisper-export` — local directory containing
-  `encoder.onnx` + `decoder.onnx` + `tokens.txt`
+**STT default:** `csukuangfj/sherpa-onnx-whisper-turbo`
+- Whisper Large V3 Turbo, multilingual (99+ languages), 809M params,
+  ~6× faster than large-v3.
 
-**TTS examples:**
-- Any voice from
-  [huggingface.co/rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)
-  — point at the `.onnx` file (the `.onnx.json` sibling is auto-located)
-- A local `.onnx` file you've downloaded
+**STT alternatives:**
+- `csukuangfj/sherpa-onnx-whisper-small` — smaller, faster, multilingual
+- `csukuangfj/sherpa-onnx-whisper-distil-medium.en` — English-only, fast
+- `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` —
+  multilingual non-Whisper (zh / en / ja / ko / yue)
+- Any local sherpa-onnx model directory
+
+**TTS default:** `csukuangfj/kokoro-multi-lang-v1_1`
+- Kokoro multilingual v1.1, **103 voices** in one model, Chinese +
+  English, 82M params. Pick a voice by passing an integer `voice`
+  field on `/v1/audio/speech` (or set `tts_speaker` in settings).
+
+**TTS alternatives:**
+- `csukuangfj/kokoro-multi-lang-v1_0` — older, 53 voices
+- Any sherpa-onnx-compatible TTS model directory (Kokoro, VITS-Piper,
+  Matcha-TTS, etc.)
 
 The **Check** button next to each model field verifies the value —
 local stat for paths, HuggingFace API for repo IDs.

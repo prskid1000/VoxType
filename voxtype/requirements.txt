@@ -9,14 +9,11 @@ Pillow>=10.2
 mss>=9.0
 pywin32>=306; platform_system == "Windows"
 
-# STT — pure ONNX Runtime via sherpa-onnx. Any sherpa-onnx-compatible
-# export works. For GPU swap onnxruntime → onnxruntime-gpu
-# (setup.ps1 handles this when -GpuSupport is on).
+# STT + TTS — one library does both. sherpa-onnx covers Whisper /
+# Paraformer / Zipformer / SenseVoice for STT, and Kokoro / VITS-Piper /
+# Matcha-TTS for synthesis. Swap onnxruntime → onnxruntime-gpu for CUDA
+# (setup.ps1 handles that when -GpuSupport is on).
 sherpa-onnx>=1.10
-
-# TTS — pure ONNX Runtime via piper-tts (which bundles onnxruntime +
-# phonemization). Same GPU swap applies.
-piper-tts>=1.2.0
 
 # Model auto-download from HuggingFace (used by both engines when the
 # user enters a repo ID instead of a local path).

@@ -7,10 +7,12 @@ User-facing docs: [README.md](README.md).
 VoxType is a **pure-Python / PySide6** voice-dictation overlay for
 Windows. Hold a hotkey, speak, release — the cleaned transcript is
 pasted at the cursor. STT and TTS both run **in-process via ONNX
-Runtime** — no separate sidecar subprocesses, no separate venvs. An
-embedded aiohttp server exposes both on one OpenAI-compatible port
-(`:6600` by default) so external clients (telecode, MCP tools) can
-reach VoxType over standard HTTP.
+Runtime** — no separate sidecar subprocesses, no separate venvs. STT
+uses `transformers` + `optimum.onnxruntime` (truly generic — any HF
+Whisper-family ONNX export works); TTS uses `sherpa-onnx` (best
+Kokoro / VITS-Piper handling). An embedded aiohttp server exposes
+both on one OpenAI-compatible port (`:6600` by default) so external
+clients reach VoxType over standard HTTP.
 
 The original Electron/React implementation (`voxtype/src/`) has been
 deleted. All Node / npm / Electron / LM Studio references are gone.
@@ -46,8 +48,8 @@ voxtype/
     ├── typer.py               # Clipboard + Ctrl+V via PowerShell SendKeys
     ├── history.py             # Append-only JSON
     │
-    ├── stt_engine.py          # In-process STT — sherpa-onnx + HF auto-download
-    ├── tts_engine.py          # In-process TTS — sherpa-onnx Kokoro + HF auto-download
+    ├── stt_engine.py          # In-process STT — transformers + optimum.onnxruntime
+    ├── tts_engine.py          # In-process TTS — sherpa-onnx Kokoro
     ├── server.py              # Embedded aiohttp /v1/audio/* server
     ├── stt.py                 # Shim → delegates to stt_engine
     ├── llm.py                 # OpenAI-shape POST to telecode proxy
@@ -112,13 +114,24 @@ text = await eng.transcribe(pcm)    # inference in single-thread executor
 await eng.unload()                  # release model, gc.collect
 ```
 
-Both engines run on `sherpa-onnx` (a thin wrapper over `onnxruntime`).
-One dependency, both engines. STT supports any sherpa-onnx Whisper /
-Paraformer / Zipformer / SenseVoice export. TTS supports Kokoro / VITS-
-Piper / Matcha-TTS exports. Defaults: Whisper Large V3 Turbo for STT
-(`csukuangfj/sherpa-onnx-whisper-turbo`, multilingual) and Kokoro
-multi-lang v1.1 for TTS (`csukuangfj/kokoro-multi-lang-v1_1`, 103
-voices, English + Chinese).
+Different backends per engine, both on ONNX Runtime:
+
+**STT** uses `optimum.onnxruntime.ORTModelForSpeechSeq2Seq` +
+`transformers.WhisperProcessor`. Loads any HF-exported Whisper-family
+ONNX repo (encoder + decoder + decoder_with_past split). Default:
+`onnx-community/whisper-base-ONNX` with q4f16 quantization variant
+— ~85 MB, 99 languages. Quant variant is configurable via
+`stt_quant` (q4f16 / q4 / int8 / fp16 / fp32).
+
+**TTS** uses `sherpa_onnx.OfflineTts` with the Kokoro config wrapper.
+Default: `csukuangfj/kokoro-multi-lang-v1_0` — 53 voices, English +
+Chinese, ~270 MB. sherpa-onnx handles phonemization, voice embeddings
+and the Kokoro-specific inference graph.
+
+Why split: `transformers` covers Whisper genericity well (any HF
+ONNX Whisper repo works), but doesn't ship a Kokoro inference path.
+sherpa-onnx covers Kokoro / VITS-Piper / Matcha well but locks STT
+to its supported families. Splitting gives us the best of both.
 
 Each engine:
 - Accepts either a **local path** or a **HuggingFace repo ID** as the
@@ -211,18 +224,21 @@ takes ~10 s.
 
 1. **Prereqs**: Python 3.10+, git, ffmpeg (warn-only), GPU detection
 2. **Single venv**: `voxtype-venv/` + `pip install -r voxtype/requirements.txt`
-   (PySide6, pynput, sounddevice, aiohttp, sherpa-onnx, huggingface_hub)
+   (PySide6, pynput, sounddevice, aiohttp, transformers, optimum,
+   sherpa-onnx, huggingface_hub)
 3. **GPU runtime** (if `-GpuSupport $true`): swap CPU `onnxruntime` for
    `onnxruntime-gpu` so both STT and TTS land on CUDA when `device='cuda'`
 4. **Pre-download default models**: snapshot_download via huggingface_hub
-   for `csukuangfj/sherpa-onnx-whisper-turbo` and
-   `csukuangfj/kokoro-multi-lang-v1_1`. Idempotent — already-cached files
-   skip. Network failure is non-fatal (engines download lazily on first
-   use).
+   with `allow_patterns` filters — STT pulls only the q4f16 ONNX files
+   from `onnx-community/whisper-base-ONNX` (~85 MB, not the full
+   ~290 MB), TTS pulls model+voices+lexicons from
+   `csukuangfj/kokoro-multi-lang-v1_0` (~270 MB). Idempotent —
+   already-cached files skip. Network failure is non-fatal (engines
+   download lazily on first use).
 5. **Scheduled task** `VoxType`: runs `pythonw.exe -m voxtype` at logon
 6. **Seed settings**: `data/settings.json` with AppSettings defaults.
-   Both engines have built-in defaults (`csukuangfj/sherpa-onnx-whisper-turbo`
-   for STT, `csukuangfj/kokoro-multi-lang-v1_1` for TTS) so dictation
+   Both engines have built-in defaults (`onnx-community/whisper-base-ONNX`
+   for STT, `csukuangfj/kokoro-multi-lang-v1_0` for TTS) so dictation
    works out of the box — settings are only for overrides.
 
 Parameters: `-GpuSupport`, `-InstallDir`.
@@ -239,7 +255,7 @@ Removed:
 - Subprocess lifecycle in `process.py` — `_spawn_whisper`, `_spawn_kokoro`,
   `_wait_ready`, `_drain`, `_force_cpu_restart`, GPU-broken stdout sniffer
 - HTTP client in `stt.py` (replaced by direct engine delegate)
-- `faster-whisper` dependency (STT now via `sherpa-onnx`)
+- `faster-whisper` dependency (STT now via `transformers` + `optimum`)
 - `piper-tts` dependency (TTS now via `sherpa-onnx` Kokoro)
 
 Added:

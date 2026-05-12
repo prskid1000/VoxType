@@ -5,11 +5,18 @@ PySide6**. Press a hotkey, speak, release — cleaned text appears at
 your cursor in any app. No cloud, no telemetry, no account.
 
 STT and TTS both run **in-process via ONNX Runtime** — no separate
-sidecar servers, no extra venvs. Point each engine at any compatible
-ONNX model (local path or HuggingFace repo ID — auto-downloaded on
-first load). An embedded aiohttp server exposes both on a single
+sidecar servers, no extra venvs. STT goes through HuggingFace
+`transformers` + `optimum` (truly generic — any HF Whisper-family ONNX
+repo loads); TTS goes through `sherpa-onnx` (best Kokoro / VITS-Piper
+support). An embedded aiohttp server exposes both on a single
 OpenAI-compatible HTTP port (default `:6600`) so external clients can
 call `/v1/audio/transcriptions` and `/v1/audio/speech`.
+
+**Default models** (~355 MB total disk):
+- **STT**: `onnx-community/whisper-base-ONNX` q4f16 — 99 languages,
+  ~85 MB (encoder 14 MB + decoders 68 MB + tokenizer ~3 MB)
+- **TTS**: `csukuangfj/kokoro-multi-lang-v1_0` — 53 voices, English +
+  Chinese, ~270 MB
 
 Sibling project of [telecode](https://github.com/prskid1000/telecode).
 LLM transcript cleanup is routed through telecode's dual-protocol proxy
@@ -31,17 +38,19 @@ cd "$env:USERPROFILE\.voxtype"
 
 1. Verify **Python 3.10+**, **git**, **ffmpeg** (optional), GPU support
 2. Create `voxtype-venv/` and `pip install -r voxtype/requirements.txt`
-   (PySide6, pynput, sounddevice, aiohttp, **sherpa-onnx**,
-   **huggingface_hub**, …) into one venv. `sherpa-onnx` powers BOTH the
-   STT and TTS engines — one library, both engines, one consistent
-   CPU/CUDA story.
+   into one venv. STT uses `transformers` + `optimum[onnxruntime]`
+   (truly generic for any HF Whisper-family export). TTS uses
+   `sherpa-onnx` (best Kokoro / VITS-Piper handling). Both target the
+   same ONNX Runtime under the hood.
 3. If `-GpuSupport $true` (default): swap CPU `onnxruntime` for
    `onnxruntime-gpu` so `device='cuda'` lands on the GPU for both STT
    and TTS (falls back to CPU automatically if CUDA isn't usable)
 4. Pre-download the default STT + TTS models into the HuggingFace cache
-   (`~/.cache/huggingface/hub`) so the first dictation isn't blocked on
-   a multi-GB download. Skipped silently if a model is already cached —
-   re-runs cost nothing.
+   (`~/.cache/huggingface/hub`) using **selective `allow_patterns`** so
+   only the variants the engines actually load are fetched — STT pulls
+   the q4f16 ONNX files only (~85 MB, not the ~290 MB fp32 weights);
+   TTS pulls model + voices + lexicons (~270 MB, not the test WAVs).
+   Skipped silently if a model is already cached — re-runs cost nothing.
 5. Register a single scheduled task `VoxType` that launches
    `pythonw.exe -m voxtype` at logon (no console window)
 6. Seed `voxtype/data/settings.json` with defaults
@@ -66,31 +75,32 @@ Re-running `setup.ps1` is idempotent.
 
 ### Picking models
 
-Both engines ship with **sensible defaults** — leave the model field
-empty in Settings → Services and the engine downloads the built-in
-default on first use. Override by typing a HuggingFace repo ID or a
-local path.
+Both engines ship with **sensible defaults** pre-filled in the model
+field — clear it to fall back to the same built-in default, or type a
+different HuggingFace repo ID / local path.
 
-**STT default:** `csukuangfj/sherpa-onnx-whisper-turbo`
-- Whisper Large V3 Turbo, multilingual (99+ languages), 809M params,
-  ~6× faster than large-v3.
+**STT default:** `onnx-community/whisper-base-ONNX` (q4f16 quant)
+- 99 languages, ~85 MB on disk
+- Loaded via `optimum.onnxruntime.ORTModelForSpeechSeq2Seq` + a HF
+  `WhisperProcessor` — truly generic, any HF Whisper-family ONNX repo
+  works the same way.
 
-**STT alternatives:**
-- `csukuangfj/sherpa-onnx-whisper-small` — smaller, faster, multilingual
-- `csukuangfj/sherpa-onnx-whisper-distil-medium.en` — English-only, fast
-- `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` —
-  multilingual non-Whisper (zh / en / ja / ko / yue)
-- Any local sherpa-onnx model directory
+**STT alternatives** (any HF Whisper-family ONNX export):
+- `onnx-community/whisper-small-ONNX` — bigger, more accurate
+- `onnx-community/whisper-large-v3-turbo-ONNX` — best quality, ~1.6 GB
+- `onnx-community/distil-whisper-distil-large-v3-ONNX` — distilled
+- Set `stt_quant` in settings to pick `q4f16` (default) / `q4` / `int8`
+  / `fp16` / empty (fp32) — whichever variant the repo ships.
 
-**TTS default:** `csukuangfj/kokoro-multi-lang-v1_1`
-- Kokoro multilingual v1.1, **103 voices** in one model, Chinese +
-  English, 82M params. Pick a voice by passing an integer `voice`
-  field on `/v1/audio/speech` (or set `tts_speaker` in settings).
+**TTS default:** `csukuangfj/kokoro-multi-lang-v1_0`
+- Kokoro multilingual v1.0, **53 voices**, Chinese + English, ~270 MB
+- Pick a voice by passing an integer `voice` field on
+  `/v1/audio/speech` (0–52), or set `tts_speaker` in settings.
 
-**TTS alternatives:**
-- `csukuangfj/kokoro-multi-lang-v1_0` — older, 53 voices
-- Any sherpa-onnx-compatible TTS model directory (Kokoro, VITS-Piper,
-  Matcha-TTS, etc.)
+**TTS alternatives** (sherpa-onnx-compatible models):
+- `csukuangfj/kokoro-multi-lang-v1_1` — 103 voices, ~395 MB
+- `csukuangfj/kokoro-en-v0_19` — 11 English voices, ~85 MB
+- Any Piper / VITS / Matcha-TTS sherpa-onnx export
 
 The **Check** button next to each model field verifies the value —
 local stat for paths, HuggingFace API for repo IDs.

@@ -1,24 +1,24 @@
-"""Direct in-process STT inference via ONNX Runtime (sherpa-onnx).
+"""Direct in-process STT inference — truly generic, via HuggingFace
+transformers + optimum.onnxruntime.
 
-The recognizer object lives on the voxtype process heap; a single-thread
-`ThreadPoolExecutor` serialises inference so the asyncio loop is never
-blocked.
+Any HF-exported Whisper-family ONNX repo works out of the box. The
+engine uses `optimum.onnxruntime.ORTModelForSpeechSeq2Seq` which knows
+the Whisper encoder/decoder/decoder_with_past split, drives the
+autoregressive decoding loop, and binds CUDA / CPU execution providers.
 
-Model source: either a local directory or a **HuggingFace repo ID**.
-If the user enters something like `csukuangfj/sherpa-onnx-whisper-small`,
-the engine snapshot_downloads the repo to the HF cache on first load
-and re-uses the cached files thereafter. Expected layout:
+Default: `onnx-community/whisper-base-ONNX` loaded with the q4f16
+quantization variant — ~85 MB total (encoder 14 MB + decoder 68 MB
++ tokenizer/configs ~3 MB), 99-language multilingual, accuracy close
+to fp32 thanks to fp16 activations + 4-bit weights.
 
-    <model>/encoder.onnx     (or encoder.int8.onnx)
-    <model>/decoder.onnx     (or decoder.int8.onnx)
-    <model>/tokens.txt
+Model source: a local model directory OR a HuggingFace repo ID. The
+HF cache stores it under `~/.cache/huggingface/hub/` and re-uses on
+subsequent loads (idempotent). For the default, only the q4f16
+variants are downloaded via `setup.ps1`'s `allow_patterns` filter —
+the full fp32 weights are skipped.
 
-CPU / GPU switching is purely an ONNX Runtime concern — sherpa-onnx
-takes a `provider` string. `device='cuda'` falls back to CPU
-automatically if onnxruntime-gpu isn't usable.
-
-Lifecycle, status callbacks and idle unload mirror tts_engine.py one-
-for-one so the tray + settings UI use the same code paths.
+CPU / GPU switching: ONNX Runtime provider. `device='cuda'` falls back
+to CPU automatically if onnxruntime-gpu isn't usable.
 """
 from __future__ import annotations
 
@@ -36,12 +36,19 @@ log = logging.getLogger("voxtype.stt_engine")
 
 
 # ── Default model ────────────────────────────────────────────────────
-# Whisper Large V3 Turbo (sherpa-onnx export): the multilingual STT
-# default sweet spot in 2026. Distilled from large-v3, ~6× faster than
-# large-v3 while staying within ~1-2% WER, ~809M params, 99+ languages.
-# Popular + latest + multilingual + fast. Ships in csukuangfj's well-
-# maintained sherpa-onnx repos.
-DEFAULT_MODEL = "csukuangfj/sherpa-onnx-whisper-turbo"
+# `onnx-community/whisper-base-ONNX` with q4f16 quantization:
+#   * ~85 MB total (encoder 14 MB + decoder 68 MB + decoder_with_past
+#     66 MB + tokenizer/configs ~3 MB — we share the decoder_with_past
+#     buffer with the main decoder so the working set is ~85 MB)
+#   * 99-language multilingual
+#   * Quantization-aware: 4-bit weights, fp16 activations preserve
+#     attention precision better than plain int8.
+# Best balance of {small, accurate, multilingual, latest} in 2026
+# under the 200 MB ceiling.
+DEFAULT_MODEL = "onnx-community/whisper-base-ONNX"
+# Quantization variant to load. The setup script's allow_patterns
+# filter downloads only these files (saves ~200 MB on disk vs. fp32).
+DEFAULT_QUANT = "q4f16"
 
 
 # ── Status type ──────────────────────────────────────────────────────
@@ -58,13 +65,12 @@ class EngineStatus:
         return "stt"
 
 
-# ── Engine ───────────────────────────────────────────────────────────
-
 class STTEngine:
     """Singleton — call `get_engine()` to access. Thread-safe."""
 
     def __init__(self) -> None:
-        self._recognizer: Any = None
+        self._model: Any = None
+        self._processor: Any = None
         self._model_lock = asyncio.Lock()
         self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxtype-stt")
         self._loaded_key: tuple | None = None
@@ -78,6 +84,7 @@ class STTEngine:
         self._model_path = ""
         self._device = "cpu"
         self._language = "en"
+        self._quant = DEFAULT_QUANT
 
     # ── Listener wiring ──────────────────────────────────────────────
 
@@ -101,48 +108,50 @@ class STTEngine:
 
     # ── Configuration ────────────────────────────────────────────────
 
+    def _effective_model(self) -> str:
+        """Empty setting → use the built-in default."""
+        return self._model_path or DEFAULT_MODEL
+
     def _key(self) -> tuple:
-        return (self._effective_model(), self._device)
+        return (self._effective_model(), self._device, self._quant)
 
     async def configure(self, s) -> None:
-        """Apply settings from `AppSettings`. If the key changed and a
-        recognizer is loaded, unload so the next call picks up new config."""
         self._model_path = str(getattr(s, "stt_model_path", "") or "")
         self._device = str(getattr(s, "stt_device", "cpu"))
         self._language = str(getattr(s, "stt_language", "en"))
         self._idle_unload_sec = int(getattr(s, "stt_idle_unload_sec", 0))
+        # Quantization variant. Allowed values match the file-name suffix
+        # used by `onnx-community` repos: "q4f16", "fp16", "int8",
+        # "q4", "bnb4", "uint8", "" (full fp32).
+        self._quant = str(getattr(s, "stt_quant", DEFAULT_QUANT) or DEFAULT_QUANT)
 
         if self._loaded_key is not None and self._loaded_key != self._key():
-            log.info("stt config changed — unloading current recognizer")
+            log.info("stt config changed — unloading current model")
             await self.unload()
 
     # ── Load / unload ────────────────────────────────────────────────
 
-    def _effective_model(self) -> str:
-        """Empty setting → use the built-in default (matches docgraph's
-        reranker pattern: empty = use default)."""
-        return self._model_path or DEFAULT_MODEL
-
     async def ensure_loaded(self) -> None:
-        if self._recognizer is not None and self._loaded_key == self._key():
+        if self._model is not None and self._loaded_key == self._key():
             return
         async with self._model_lock:
-            if self._recognizer is not None and self._loaded_key == self._key():
+            if self._model is not None and self._loaded_key == self._key():
                 return
-            if self._recognizer is not None:
+            if self._model is not None:
                 await self._do_unload_locked()
             await self._do_load_locked()
 
     async def _do_load_locked(self) -> None:
-        model = self._effective_model()
-        log.info("stt loading model=%s device=%s", model, self._device)
+        model_id = self._effective_model()
+        log.info("stt loading model=%s device=%s quant=%s",
+                 model_id, self._device, self._quant)
         self._status.last_error = ""
         self._status.running = False
         self._status.ready = False
         self._notify()
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(self._exec, self._build_recognizer, model)
+            await loop.run_in_executor(self._exec, self._build_model, model_id)
             self._loaded_key = self._key()
             self._status.running = True
             self._status.ready = True
@@ -152,7 +161,8 @@ class STTEngine:
             self._ensure_idle_watcher()
         except Exception as exc:
             log.error("stt load failed: %s", exc)
-            self._recognizer = None
+            self._model = None
+            self._processor = None
             self._loaded_key = None
             self._status.running = False
             self._status.ready = False
@@ -160,43 +170,54 @@ class STTEngine:
             self._notify()
             raise
 
-    def _build_recognizer(self, model_path: str) -> None:
-        """Sync — runs in the executor. Resolves the model (local path
-        OR HuggingFace repo) and builds a sherpa-onnx recognizer."""
-        import sherpa_onnx
-        model_dir = resolve_model_dir(model_path)
-        # Resolve encoder / decoder. Prefer fp32; fall back to quantized.
-        encoder = _pick(model_dir,
-                         ("encoder.onnx", "encoder.int8.onnx",
-                          "encoder-fp16.onnx", "encoder-int8.onnx"))
-        decoder = _pick(model_dir,
-                         ("decoder.onnx", "decoder.int8.onnx",
-                          "decoder-fp16.onnx", "decoder-int8.onnx"))
-        tokens = _pick(model_dir, ("tokens.txt",))
-        if encoder is None or decoder is None or tokens is None:
-            raise RuntimeError(
-                f"sherpa-onnx model files not found under {model_dir} — "
-                "expected encoder*.onnx + decoder*.onnx + tokens.txt"
+    def _build_model(self, model_id: str) -> None:
+        """Sync — runs in the executor. Loads via optimum.onnxruntime.
+
+        optimum's `ORTModelForSpeechSeq2Seq` handles the Whisper-shape
+        ONNX export (split encoder + decoder + decoder_with_past) and
+        drives the autoregressive generate() loop. Provider choice lands
+        the inference on CPU or CUDA; the CPU provider is the silent
+        fallback if CUDA init fails.
+        """
+        from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+        from transformers import AutoProcessor
+
+        provider = ("CUDAExecutionProvider" if self._device == "cuda"
+                    else "CPUExecutionProvider")
+        subfolder, file_names = _split_for_quant(model_id, self._quant)
+
+        # Build optimum kwargs. The quantization-specific files are
+        # nested under `subfolder=onnx` in `onnx-community` repos.
+        kwargs: dict[str, Any] = {"provider": provider}
+        if subfolder:
+            kwargs["subfolder"] = subfolder
+        if file_names:
+            kwargs.update(file_names)
+
+        try:
+            self._model = ORTModelForSpeechSeq2Seq.from_pretrained(model_id, **kwargs)
+        except Exception as exc:
+            # If the requested quant variant isn't present, fall through
+            # to the un-suffixed (fp32) default. Quietly logged — the
+            # model still loads, just bigger.
+            log.warning("stt: quant=%s load failed (%s) — retrying default files",
+                        self._quant, exc)
+            self._model = ORTModelForSpeechSeq2Seq.from_pretrained(
+                model_id, provider=provider,
+                **({"subfolder": subfolder} if subfolder else {}),
             )
-        provider = "cuda" if self._device == "cuda" else "cpu"
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-            encoder=str(encoder),
-            decoder=str(decoder),
-            tokens=str(tokens),
-            language=self._language,
-            task="transcribe",
-            provider=provider,
-        )
+        self._processor = AutoProcessor.from_pretrained(model_id)
 
     async def unload(self) -> None:
         async with self._model_lock:
             await self._do_unload_locked()
 
     async def _do_unload_locked(self) -> None:
-        if self._recognizer is None:
+        if self._model is None:
             return
         log.info("stt unloading")
-        self._recognizer = None
+        self._model = None
+        self._processor = None
         self._loaded_key = None
         self._status.running = False
         self._status.ready = False
@@ -210,17 +231,29 @@ class STTEngine:
         """Run STT on raw 16 kHz mono int16 PCM. Returns the text."""
         await self.ensure_loaded()
         self._last_used = time.monotonic()
+        lang = (language or self._language or "en").strip() or "en"
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self._exec, self._do_transcribe, pcm)
+        return await loop.run_in_executor(self._exec, self._do_transcribe, pcm, lang)
 
-    def _do_transcribe(self, pcm: bytes) -> str:
+    def _do_transcribe(self, pcm: bytes, language: str) -> str:
         """Sync — runs in the executor."""
         import numpy as np
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(16000, audio)
-        self._recognizer.decode_stream(stream)
-        return (stream.result.text or "").strip()
+        inputs = self._processor(
+            audio, sampling_rate=16000, return_tensors="pt",
+        )
+        # forced_decoder_ids steers Whisper toward the target language
+        # without invoking the model's own language-detection pass.
+        forced = self._processor.get_decoder_prompt_ids(
+            language=language, task="transcribe",
+        )
+        generated = self._model.generate(
+            inputs.input_features,
+            forced_decoder_ids=forced,
+            max_new_tokens=440,
+        )
+        text = self._processor.batch_decode(generated, skip_special_tokens=True)[0]
+        return (text or "").strip()
 
     # ── Idle unload watcher ──────────────────────────────────────────
 
@@ -233,7 +266,7 @@ class STTEngine:
             INTERVAL = 30.0
             while True:
                 time.sleep(INTERVAL)
-                if self._recognizer is None:
+                if self._model is None:
                     continue
                 if self._idle_unload_sec <= 0:
                     continue
@@ -251,52 +284,33 @@ class STTEngine:
                          name="voxtype-stt-idle").start()
 
 
-def _pick(directory: Path, candidates: tuple[str, ...]) -> Path | None:
-    """Return the first existing candidate file inside `directory`.
-    Walks one level deep so models packed inside a sub-folder still work."""
-    for name in candidates:
-        p = directory / name
-        if p.exists():
-            return p
-    # One-level deep fallback — HF snapshots sometimes nest files inside a dir
-    for sub in directory.iterdir() if directory.is_dir() else []:
-        if sub.is_dir():
-            for name in candidates:
-                p = sub / name
-                if p.exists():
-                    return p
-    return None
+# ── Helpers ──────────────────────────────────────────────────────────
 
+def _split_for_quant(model_id: str, quant: str) -> tuple[str, dict]:
+    """Return (subfolder, file-name kwargs) for the requested quant.
 
-def resolve_model_dir(model_path: str) -> Path:
-    """Accept either a local path or a HuggingFace repo ID.
+    `onnx-community/*-ONNX` repos lay out variants under `onnx/`:
+        onnx/encoder_model.onnx              # fp32
+        onnx/encoder_model_q4f16.onnx
+        onnx/encoder_model_fp16.onnx
+        ...
 
-    Returns a local `Path` to the model directory:
-      - If `model_path` exists locally (file or dir), return its parent dir
-        (or the dir itself).
-      - Otherwise treat it as `org/repo` and `snapshot_download()` it via
-        `huggingface_hub`. The cached dir is returned.
+    Optimum's `from_pretrained` takes `encoder_file_name`,
+    `decoder_file_name`, `decoder_with_past_file_name`. We pass them
+    when `quant` is non-empty; otherwise let optimum pick the default.
     """
-    if not model_path:
-        # Should never happen — STTEngine._effective_model() substitutes
-        # DEFAULT_MODEL before calling. Guard anyway.
-        model_path = DEFAULT_MODEL
-    p = Path(model_path).expanduser()
-    if p.exists():
-        return p if p.is_dir() else p.parent
-    # Looks like an HF repo ID? (contains '/', not absolute)
-    if "/" in model_path and not p.is_absolute():
-        try:
-            from huggingface_hub import snapshot_download
-        except ImportError as exc:
-            raise RuntimeError(
-                "huggingface_hub not installed — `pip install huggingface_hub` "
-                "or enter a local path to the model directory"
-            ) from exc
-        log.info("stt downloading HF repo %s …", model_path)
-        cached = snapshot_download(repo_id=model_path)
-        return Path(cached)
-    raise RuntimeError(f"model not found: {model_path}")
+    is_onnx_community = "/" in model_id and "onnx" in model_id.split("/")[0].lower()
+    subfolder = "onnx" if is_onnx_community else ""
+    if not quant:
+        return subfolder, {}
+    suffix = quant.lower().strip("_-")
+    if not suffix:
+        return subfolder, {}
+    return subfolder, {
+        "encoder_file_name": f"encoder_model_{suffix}.onnx",
+        "decoder_file_name": f"decoder_model_{suffix}.onnx",
+        "decoder_with_past_file_name": f"decoder_with_past_model_{suffix}.onnx",
+    }
 
 
 # ── Module singleton ─────────────────────────────────────────────────

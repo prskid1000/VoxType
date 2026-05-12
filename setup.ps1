@@ -114,13 +114,15 @@ if (-not (Test-Path $voxPython)) {
     & $pythonExe -m venv $voxVenv
 }
 
-Write-Host "    pip install core deps (PySide6, pynput, sounddevice, aiohttp, sherpa-onnx, huggingface_hub)..." -ForegroundColor DarkGray
+Write-Host "    pip install core deps (PySide6, pynput, sounddevice, aiohttp, transformers, optimum, sherpa-onnx, huggingface_hub)..." -ForegroundColor DarkGray
 & $voxPython -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
 & "$voxVenv\Scripts\pip.exe" install -r "$voxTypeDir\requirements.txt" --no-cache-dir --quiet 2>&1 | Out-Null
 
 if (-not (Test-Path "$voxVenv\Lib\site-packages\PySide6")) { Fail "VoxType UI pip install failed" }
-if (-not (Test-Path "$voxVenv\Lib\site-packages\sherpa_onnx")) { Fail "sherpa-onnx install failed" }
-Ok "Core deps installed (UI + STT + TTS via sherpa-onnx)"
+if (-not (Test-Path "$voxVenv\Lib\site-packages\transformers")) { Fail "transformers install failed (STT backend)" }
+if (-not (Test-Path "$voxVenv\Lib\site-packages\optimum")) { Fail "optimum install failed (STT backend)" }
+if (-not (Test-Path "$voxVenv\Lib\site-packages\sherpa_onnx")) { Fail "sherpa-onnx install failed (TTS backend)" }
+Ok "Core deps installed (UI + STT via transformers+optimum + TTS via sherpa-onnx)"
 
 # GPU: sherpa-onnx uses ONNX Runtime under the hood for both engines.
 # Swap the CPU `onnxruntime` wheel (pulled in transitively) for
@@ -137,51 +139,80 @@ if ($GpuSupport) {
     }
 }
 
-# ─── Pre-download default models (idempotent) ────────────────────────
+# ─── Pre-download default models (idempotent + size-aware) ───────────
 #
-# huggingface_hub.snapshot_download() uses the HF cache (default
-# ~/.cache/huggingface/hub) and skips files that already exist — so
-# this step is safe to re-run, only the missing pieces are fetched.
+# Both downloads use huggingface_hub.snapshot_download with
+# allow_patterns filters so we only fetch the variants the engines
+# actually load — saves disk over pulling every quantization variant.
 #
-# Pulled now so the first dictation isn't blocked on a multi-GB
-# download. Errors are non-fatal: if the user has no network at
-# install time, the engines just download lazily on first use.
+# STT: onnx-community/whisper-base-ONNX, q4f16 variant only (~85 MB).
+# TTS: csukuangfj/kokoro-multi-lang-v1_0, model + voices + lexicons
+#      (~270 MB minimal footprint).
+#
+# snapshot_download skips files already in the HF cache, so re-runs
+# are cheap. Errors are non-fatal: engines download lazily on first
+# use if this step fails.
 
 Step "Pre-downloading default models"
 
-$stt_default = "csukuangfj/sherpa-onnx-whisper-turbo"
-$tts_default = "csukuangfj/kokoro-multi-lang-v1_1"
-
-Write-Host "    Fetching $stt_default (~1.6 GB) — skipped if already cached..." -ForegroundColor DarkGray
+Write-Host "    Fetching STT default (onnx-community/whisper-base-ONNX, q4f16 ~85 MB)..." -ForegroundColor DarkGray
 $rc_stt = & $voxPython -c @"
 import sys
 try:
     from huggingface_hub import snapshot_download
-    p = snapshot_download(repo_id='$stt_default')
+    # Pull only what the engine loads. The fp32 / int8 / fp16 variants
+    # are NOT fetched — saves ~200 MB on disk.
+    p = snapshot_download(
+        repo_id='onnx-community/whisper-base-ONNX',
+        allow_patterns=[
+            '*.json',
+            'tokenizer*',
+            'merges.txt',
+            'vocab.json',
+            'onnx/encoder_model_q4f16.onnx',
+            'onnx/decoder_model_q4f16.onnx',
+            'onnx/decoder_with_past_model_q4f16.onnx',
+        ],
+    )
     print('STT cached at', p)
 except Exception as e:
     print('STT download skipped:', e, file=sys.stderr)
     sys.exit(1)
 "@ 2>&1
 if ($LASTEXITCODE -eq 0) {
-    Ok "STT default cached ($stt_default)"
+    Ok "STT default cached (whisper-base q4f16, ~85 MB)"
 } else {
     Warn "STT model pre-download failed (will download lazily on first use): $rc_stt"
 }
 
-Write-Host "    Fetching $tts_default (~395 MB) — skipped if already cached..." -ForegroundColor DarkGray
+Write-Host "    Fetching TTS default (csukuangfj/kokoro-multi-lang-v1_0, ~270 MB)..." -ForegroundColor DarkGray
 $rc_tts = & $voxPython -c @"
 import sys
 try:
     from huggingface_hub import snapshot_download
-    p = snapshot_download(repo_id='$tts_default')
+    # Minimal Kokoro footprint: model + voices + tokens + lexicons +
+    # phonemizer data. Skips test WAVs and any oversized extras.
+    p = snapshot_download(
+        repo_id='csukuangfj/kokoro-multi-lang-v1_0',
+        allow_patterns=[
+            'model.onnx',
+            'voices.bin',
+            'tokens.txt',
+            'lexicon*.txt',
+            'dict/**',
+            'espeak-ng-data/**',
+            '*.fst',
+            'README.md',
+            'LICENSE',
+        ],
+    )
     print('TTS cached at', p)
 except Exception as e:
     print('TTS download skipped:', e, file=sys.stderr)
     sys.exit(1)
 "@ 2>&1
 if ($LASTEXITCODE -eq 0) {
-    Ok "TTS default cached ($tts_default)"
+    Ok "TTS default cached (kokoro-multi-lang-v1_0, ~270 MB)"
 } else {
     Warn "TTS model pre-download failed (will download lazily on first use): $rc_tts"
 }

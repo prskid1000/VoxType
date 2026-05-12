@@ -45,11 +45,11 @@ log = logging.getLogger("voxtype.tts_engine")
 
 
 # ── Default model ────────────────────────────────────────────────────
-# Kokoro multi-lang v1.1: best balance of latest + popular + multi-voice
-# + multilingual + small in mid-2026. 103 speakers, Chinese + English
-# (GB / US), ~82M params, ONNX-exported by csukuangfj and shipped in
-# the sherpa-onnx TTS samples gallery.
-DEFAULT_MODEL = "csukuangfj/kokoro-multi-lang-v1_1"
+# Kokoro multi-lang v1.0: 53 speakers, Chinese + English, ~270 MB
+# minimal footprint. Picked over v1.1 (103 speakers, ~395 MB) to keep
+# disk usage closer to the project's small-install target. v1.1 is
+# better if you want the extra voices — just point the model field at it.
+DEFAULT_MODEL = "csukuangfj/kokoro-multi-lang-v1_0"
 
 
 # ── Status type ──────────────────────────────────────────────────────

@@ -9,12 +9,20 @@ Pillow>=10.2
 mss>=9.0
 pywin32>=306; platform_system == "Windows"
 
-# STT + TTS — one library does both. sherpa-onnx covers Whisper /
-# Paraformer / Zipformer / SenseVoice for STT, and Kokoro / VITS-Piper /
-# Matcha-TTS for synthesis. Swap onnxruntime → onnxruntime-gpu for CUDA
-# (setup.ps1 handles that when -GpuSupport is on).
+# STT — truly generic, via HuggingFace transformers + optimum's ONNX
+# Runtime backend. Any HF-exported Whisper-family ONNX repo works
+# (encoder + decoder + decoder_with_past split). Quantization variants
+# like q4f16 / int8 are picked at load time. Swap onnxruntime →
+# onnxruntime-gpu for CUDA (setup.ps1 handles that with -GpuSupport).
+transformers>=4.45
+optimum[onnxruntime]>=1.22
+
+# TTS — sherpa-onnx covers Kokoro / VITS-Piper / Matcha-TTS families
+# with the right pipeline for each (phonemization, voice embeddings).
+# The default Kokoro multi-lang v1.0 model needs sherpa-onnx's Kokoro
+# config wrapper.
 sherpa-onnx>=1.10
 
-# Model auto-download from HuggingFace (used by both engines when the
-# user enters a repo ID instead of a local path).
+# Model auto-download from HuggingFace (used by both engines + by
+# setup.ps1 to pre-fetch the default model files with allow_patterns).
 huggingface_hub>=0.24

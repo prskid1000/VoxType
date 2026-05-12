@@ -4,25 +4,23 @@ Local voice dictation overlay for Windows, written in **pure Python +
 PySide6**. Press a hotkey, speak, release — cleaned text appears at
 your cursor in any app. No cloud, no telemetry, no account.
 
-STT and TTS both run **in-process via ONNX Runtime** — no separate
-sidecar servers, no extra venvs. STT goes through HuggingFace
-`transformers` + `optimum` (truly generic — any HF Whisper-family ONNX
-repo loads); TTS goes through `sherpa-onnx` (best Kokoro / VITS-Piper
-support). An embedded aiohttp server exposes both on a single
-OpenAI-compatible HTTP port (default `:6600`) so external clients can
-call `/v1/audio/transcriptions` and `/v1/audio/speech`.
+STT and TTS both run **in-process via PyTorch** — one ML backend, one
+venv. STT uses HuggingFace `transformers` (any Whisper-family repo
+works); TTS uses the `kokoro` PyPI package wrapping Kokoro-82M. An
+embedded aiohttp server exposes both on a single OpenAI-compatible
+HTTP port (default `:6600`) so external clients can call
+`/v1/audio/transcriptions` and `/v1/audio/speech`.
 
-**Default models** (~355 MB total disk):
-- **STT**: `onnx-community/whisper-base-ONNX` q4f16 — 99 languages,
-  ~85 MB (encoder 14 MB + decoders 68 MB + tokenizer ~3 MB)
-- **TTS**: `csukuangfj/kokoro-multi-lang-v1_0` — 53 voices, English +
-  Chinese, ~270 MB
+**Default models** (~475 MB total disk):
+- **STT**: `openai/whisper-base` — 99 languages, ~145 MB
+- **TTS**: `hexgrad/Kokoro-82M` — 54 voices in 9 language families
+  (American + British English, Spanish, French, Hindi, Italian,
+  Japanese, Brazilian Portuguese, Mandarin Chinese), ~327 MB
 
 Sibling project of [telecode](https://github.com/prskid1000/telecode).
 LLM transcript cleanup is routed through telecode's dual-protocol proxy
-at `http://127.0.0.1:1235`, so any model telecode serves (llama.cpp,
-Qwen-VL, etc.) becomes a dictation backend automatically. There is no
-direct LM Studio dependency.
+at `http://127.0.0.1:1235`, so any model telecode serves becomes a
+dictation backend automatically.
 
 ---
 
@@ -37,28 +35,20 @@ cd "$env:USERPROFILE\.voxtype"
 `setup.ps1` will:
 
 1. Verify **Python 3.10+**, **git**, **ffmpeg** (optional), GPU support
-2. Create `voxtype-venv/` and `pip install -r voxtype/requirements.txt`
-   into one venv. STT uses `transformers` + `optimum[onnxruntime]`
-   (truly generic for any HF Whisper-family export). TTS uses
-   `sherpa-onnx` (best Kokoro / VITS-Piper handling). Both target the
-   same ONNX Runtime under the hood.
-3. If `-GpuSupport $true` (default): swap CPU `onnxruntime` for
-   `onnxruntime-gpu` so `device='cuda'` lands on the GPU for both STT
-   and TTS (falls back to CPU automatically if CUDA isn't usable)
-4. Pre-download the default STT + TTS models into the HuggingFace cache
-   (`~/.cache/huggingface/hub`) using **selective `allow_patterns`** so
-   only the variants the engines actually load are fetched — STT pulls
-   the q4f16 ONNX files only (~85 MB, not the ~290 MB fp32 weights);
-   TTS pulls model + voices + lexicons (~270 MB, not the test WAVs).
-   Skipped silently if a model is already cached — re-runs cost nothing.
-5. Register a single scheduled task `VoxType` that launches
+2. Create `voxtype-venv/` and install:
+   - `torch` (CUDA 13 nightly wheel if `-GpuSupport`, CPU wheel otherwise)
+   - `transformers` (STT)
+   - `kokoro` (TTS)
+   - PySide6 / pynput / sounddevice / soundfile / aiohttp / numpy / pywin32 / Pillow / mss
+3. Pre-download the default STT + TTS models into the HuggingFace
+   cache (`~/.cache/huggingface/hub`). Skipped silently if already
+   cached — re-runs cost nothing.
+4. Register a scheduled task `VoxType` that launches
    `pythonw.exe -m voxtype` at logon (no console window)
-6. Seed `voxtype/data/settings.json` with defaults
-7. Start VoxType immediately
+5. Seed `voxtype/data/settings.json` with defaults
+6. Start VoxType immediately
 
-Re-running `setup.ps1` is idempotent at every phase: venvs reuse
-existing site-packages, the model pre-download skips cached files, the
-scheduled task is recreated cleanly.
+Re-running `setup.ps1` is idempotent at every phase.
 
 Look for the tray icon (bottom-right). Press **Ctrl+Win**, speak,
 release.
@@ -66,41 +56,38 @@ release.
 ### Setup options
 
 ```powershell
-.\setup.ps1                            # full install (STT + TTS, GPU)
-.\setup.ps1 -GpuSupport $false         # CPU-only ONNX Runtime
-.\setup.ps1 -InstallDir "D:\voxtype"   # custom location
+.\setup.ps1                              # full install (CUDA 13 nightly torch)
+.\setup.ps1 -CudaVersion cu124           # CUDA 12.4 stable torch (recommended if you don't have CUDA 13)
+.\setup.ps1 -GpuSupport $false           # CPU-only torch
+.\setup.ps1 -InstallDir "D:\voxtype"     # custom location
 ```
-
-Re-running `setup.ps1` is idempotent.
 
 ### Picking models
 
-Both engines ship with **sensible defaults** pre-filled in the model
+Both engines ship with sensible defaults pre-filled in the model
 field — clear it to fall back to the same built-in default, or type a
 different HuggingFace repo ID / local path.
 
-**STT default:** `onnx-community/whisper-base-ONNX` (q4f16 quant)
-- 99 languages, ~85 MB on disk
-- Loaded via `optimum.onnxruntime.ORTModelForSpeechSeq2Seq` + a HF
-  `WhisperProcessor` — truly generic, any HF Whisper-family ONNX repo
-  works the same way.
+**STT default:** `openai/whisper-base`
+- 99 languages, ~145 MB on disk
+- Loaded via `transformers.WhisperForConditionalGeneration` — any HF
+  Whisper-family repo works.
 
-**STT alternatives** (any HF Whisper-family ONNX export):
-- `onnx-community/whisper-small-ONNX` — bigger, more accurate
-- `onnx-community/whisper-large-v3-turbo-ONNX` — best quality, ~1.6 GB
-- `onnx-community/distil-whisper-distil-large-v3-ONNX` — distilled
-- Set `stt_quant` in settings to pick `q4f16` (default) / `q4` / `int8`
-  / `fp16` / empty (fp32) — whichever variant the repo ships.
+**STT alternatives:**
+- `openai/whisper-small` / `whisper-medium` / `whisper-large-v3` — bigger, more accurate
+- `openai/whisper-large-v3-turbo` — fast + accurate, ~1.6 GB
+- `distil-whisper/distil-large-v3` — distilled, ~756 MB
+- Any community fine-tune on HF.
 
-**TTS default:** `csukuangfj/kokoro-multi-lang-v1_0`
-- Kokoro multilingual v1.0, **53 voices**, Chinese + English, ~270 MB
-- Pick a voice by passing an integer `voice` field on
-  `/v1/audio/speech` (0–52), or set `tts_speaker` in settings.
-
-**TTS alternatives** (sherpa-onnx-compatible models):
-- `csukuangfj/kokoro-multi-lang-v1_1` — 103 voices, ~395 MB
-- `csukuangfj/kokoro-en-v0_19` — 11 English voices, ~85 MB
-- Any Piper / VITS / Matcha-TTS sherpa-onnx export
+**TTS default:** `hexgrad/Kokoro-82M`
+- 54 voices, 9 language families, ~327 MB
+- The **Voice** field accepts the Kokoro voice name string:
+  - `a{f,m}_*` — American English (`af_heart`, `am_adam`)
+  - `b{f,m}_*` — British English  (`bf_emma`, `bm_george`)
+  - `e_`, `f_`, `h_`, `i_` — Spanish, French, Hindi, Italian
+  - `j{f,m}_*` — Japanese (`jf_alpha`, `jm_kumo`)
+  - `p{f,m}_*` — Brazilian Portuguese
+  - `z{f,m}_*` — Mandarin Chinese (`zf_xiaobei`, `zm_yunjian`)
 
 The **Check** button next to each model field verifies the value —
 local stat for paths, HuggingFace API for repo IDs.
@@ -112,16 +99,15 @@ local stat for paths, HuggingFace API for repo IDs.
 | Dependency | Required for | Where to get it |
 |---|---|---|
 | **Windows 10/11** | Target OS | — |
-| **Python 3.10+** | Everything | https://python.org |
+| **Python 3.10–3.12** | Everything (kokoro pins <3.13) | https://python.org |
 | **git** | Cloning the repo | https://git-scm.com |
 | **ffmpeg** (optional) | Non-WAV audio uploads to the embedded server | `winget install ffmpeg` |
-| **NVIDIA GPU + CUDA driver** | Optional — STT + TTS fall back to CPU | https://nvidia.com/drivers |
+| **NVIDIA GPU + recent driver** | Optional — STT + TTS fall back to CPU. torch ships its own CUDA runtime, so no separate CUDA toolkit install is needed. | https://nvidia.com/drivers |
+| **espeak-ng** (recommended for non-English TTS) | Phonemizer fallback for languages misaki doesn't cover | `winget install eSpeak-NG.eSpeak-NG` |
 | **telecode** (optional) | LLM transcript cleanup | https://github.com/prskid1000/telecode |
 
 Without telecode running, dictation still works — you just get raw
 STT transcripts (no filler-word cleanup, no punctuation fixes).
-Set `enhance_enabled = false` in settings to silence the "proxy
-unreachable" warnings.
 
 ---
 
@@ -144,13 +130,10 @@ if enhance_enabled:
     → if screen_context: capture active display + paint red cursor
       marker → JPEG base64
     → llm.enhance() — OpenAI-shape POST to telecode proxy (:1235)
-                      with JSON-schema response_format
-    → 4-stage JSON recovery for malformed responses
     → LRU cache (50 entries) keyed on (transcript, screenshot fingerprint)
 
 → pill = typing
-→ typer.type_text() — write to clipboard, send Ctrl+V via PowerShell
-                      SendKeys, restore previous clipboard contents
+→ typer.type_text() — clipboard + Ctrl+V via PowerShell SendKeys
 → history.add() — append to data/history.json (last 500)
 → pill = idle
 ```
@@ -166,20 +149,10 @@ GET  /v1/models                →  engine list
 GET  /health                   →  engine readiness snapshot
 ```
 
-The hot path inside VoxType calls the engines directly — this server
-exists so external clients (telecode, MCP tools, any OpenAI-shape API
-consumer) can reach VoxType over standard HTTP.
-
-### Threading
-
-- **Main thread**: Qt event loop (tray, pill, settings window)
-- **Worker thread**: dedicated asyncio loop for HTTP server + inference
-- **Inference thread pools**: one single-thread executor per engine —
-  serialises model calls so we never OOM from concurrent inference
-- **Pynput thread**: raw keyboard input hook
-
-Quit uses an `os._exit(0)` watchdog (5 s). Engine models are
-deallocated and CUDA caches flushed in `process.stop_all()`.
+The `model` and `voice` request fields are **accepted for OpenAI API
+compatibility but ignored** — VoxType controls which model is loaded
+and which voice is used through its own settings. External clients
+only address VoxType by host + port; they don't pick the model.
 
 ---
 
@@ -187,7 +160,7 @@ deallocated and CUDA caches flushed in `process.stop_all()`.
 
 ```
 ⬡/⬢ STT     ▸ status + model + Load / Unload / Reload
-⬡/⬢ TTS     ▸ status + model + Load / Unload / Reload
+⬡/⬢ TTS     ▸ status + voice + Load / Unload / Reload
 ⬡/⬢ LLM     ▸ proxy model + Test Proxy Connection
 ⬢   Pill    ▸ Hide Pill / Show Pill + Reset Position
 ─
@@ -200,20 +173,19 @@ The Settings window has these sections:
 
 - **Dictation** — hotkey mode, live **Rebind** button, auto-stop on
   silence, VAD, append mode, save history
-- **Services** — three cards:
+- **Services** — three cards (each with a footer row containing a live
+  status pill and Load / Unload / Reload buttons):
   - **OpenAI HTTP Server** — enable + port for the embedded server
-  - **STT** — enable, auto-start, idle unload, model (free text accepting
-    HF repo or local path + Browse + HF Check button), device, language,
-    Reload
-  - **TTS** — enable, auto-start, idle unload, model path (with Browse
-    file dialog), device, speaker, length scale, Reload
+  - **STT** — enable, auto-start, idle unload, model, device, language
+  - **TTS** — enable, auto-start, idle unload, model, device, voice
+    (Kokoro voice name), speed
 - **LLM** — enhance on/off, screen context, proxy URL + model, Test
   Proxy Connection
 - **History** — saved transcripts with 📋 Raw / 📋 Final copy icons
 - **Logs** — live-tailing `voxtype.log` / `voxtype.log.prev`
 
 Every toggle writes through to `data/settings.json` atomically. Engine
-settings (model, device, compute type) trigger an automatic reload on
+settings (model, device, voice) trigger an automatic reload on the
 next inference call.
 
 ---
@@ -250,8 +222,7 @@ outside the repo. `voxtype/data/` is gitignored.
 
 `proxy_model` can be anything telecode's llamacpp registry recognises,
 OR anything in `proxy.model_mapping`. VoxType sends OpenAI-shape
-`/v1/chat/completions` with `response_format: json_schema` — the model
-returns structured output and VoxType extracts the `output` field.
+`/v1/chat/completions` with `response_format: json_schema`.
 
 If the request fails, the **original STT transcript** is returned
 unchanged — dictation keeps working when the LLM is unreachable.
@@ -287,3 +258,5 @@ install directory and repo-local `voxtype/data/`.
 - **TTS isn't wired into the dictation pipeline** — it's served via the
   HTTP endpoint for external clients. Speak-back is not part of the
   hotkey flow.
+- **CUDA 13 torch wheels are nightly.** Stable cu130 wheels haven't
+  shipped yet. Use `-CudaVersion cu124` for the stable channel.

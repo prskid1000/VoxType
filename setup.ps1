@@ -3,11 +3,11 @@
 .SYNOPSIS
     VoxType Setup — local voice dictation overlay for Windows.
 .DESCRIPTION
-    Installs the VoxType UI Python deps (PySide6 + pynput + sherpa-onnx +
-    huggingface_hub + …) into a single venv, and registers a scheduled
-    task `VoxType` that auto-starts at logon. STT and TTS both run
-    in-process via sherpa-onnx (ONNX Runtime) — no separate child
-    processes, no extra venvs.
+    Installs the VoxType Python deps (PySide6 + pynput + torch +
+    transformers + kokoro + …) into a single venv, and registers a
+    scheduled task `VoxType` that auto-starts at logon. STT and TTS
+    both run in-process via PyTorch — no separate child processes,
+    no extra venvs.
 
     External clients (telecode, MCP tools) reach VoxType through the
     embedded OpenAI-compatible HTTP server on port 6600 (configurable).
@@ -15,12 +15,18 @@
 .PARAMETER InstallDir
     Where everything lives. Defaults to ~/.voxtype.
 .PARAMETER GpuSupport
-    Swap CPU `onnxruntime` for `onnxruntime-gpu` so device='cuda' works
-    for both STT and TTS. Set to $false for CPU-only.
+    Install torch with a CUDA wheel so STT + TTS run on GPU when
+    device='cuda'. Set to $false for CPU-only.
+.PARAMETER CudaVersion
+    Which CUDA wheel index to use when -GpuSupport is on. Accepts
+    "cu130" (CUDA 13, nightly), "cu124" (CUDA 12.4 stable, recommended
+    if you don't have CUDA 13 installed), or "cpu". Default cu130.
 #>
 param(
     [string]$InstallDir   = "$env:USERPROFILE\.voxtype",
-    [bool]  $GpuSupport   = $true
+    [bool]  $GpuSupport   = $true,
+    [ValidateSet("cu130", "cu124", "cpu")]
+    [string]$CudaVersion  = "cu130"
 )
 
 $ErrorActionPreference = "Stop"
@@ -99,7 +105,7 @@ Step "Install directory: $InstallDir"
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 Ok "Ready"
 
-# ─── VoxType venv (single venv, all in-process via ONNX Runtime) ─────
+# ─── VoxType venv (single venv, both engines run in-process via torch)
 
 Step "Installing VoxType (single venv — UI + STT + TTS all in-process)"
 $voxVenv    = Join-Path $InstallDir "voxtype-venv"
@@ -114,40 +120,53 @@ if (-not (Test-Path $voxPython)) {
     & $pythonExe -m venv $voxVenv
 }
 
-Write-Host "    pip install core deps (PySide6, pynput, sounddevice, aiohttp, transformers, optimum, sherpa-onnx, huggingface_hub)..." -ForegroundColor DarkGray
 & $voxPython -m pip install --upgrade pip --no-cache-dir --quiet 2>&1 | Out-Null
+
+# ── torch first, with the right CUDA index ──────────────────────────
+# torch ships its own bundled CUDA runtime, so installing the cu130
+# wheel works on machines with CUDA 13 drivers without a separate
+# toolkit install. CPU is the safe fallback when -GpuSupport is off.
+$torchIndex = $null
+if (-not $GpuSupport) {
+    $torchIndex = "https://download.pytorch.org/whl/cpu"
+    Write-Host "    pip install torch (CPU build)..." -ForegroundColor DarkGray
+} elseif ($CudaVersion -eq "cu130") {
+    # PyTorch nightly is the only channel currently shipping CUDA 13
+    # wheels (as of mid-2026). Once stable wheels land, switch to the
+    # /whl/cu130 URL.
+    $torchIndex = "https://download.pytorch.org/whl/nightly/cu130"
+    Write-Host "    pip install torch (CUDA 13 nightly)..." -ForegroundColor DarkGray
+} elseif ($CudaVersion -eq "cu124") {
+    $torchIndex = "https://download.pytorch.org/whl/cu124"
+    Write-Host "    pip install torch (CUDA 12.4 stable)..." -ForegroundColor DarkGray
+} else {
+    $torchIndex = "https://download.pytorch.org/whl/cpu"
+    Write-Host "    pip install torch (CPU)..." -ForegroundColor DarkGray
+}
+
+$pipExtra = @()
+if ($CudaVersion -eq "cu130" -and $GpuSupport) { $pipExtra += "--pre" }
+& "$voxVenv\Scripts\pip.exe" install @pipExtra torch --index-url $torchIndex --no-cache-dir --quiet 2>&1 | Out-Null
+
+if (-not (Test-Path "$voxVenv\Lib\site-packages\torch")) {
+    Fail "torch install failed (tried index $torchIndex)"
+}
+$torchCudaCheck = & $voxPython -c "import torch; print(torch.version.cuda or 'cpu')" 2>&1
+Ok "torch installed (cuda=$torchCudaCheck)"
+
+# ── Remaining deps (PySide6, transformers, kokoro, …) ───────────────
+Write-Host "    pip install remaining deps (PySide6, transformers, kokoro, …)..." -ForegroundColor DarkGray
 & "$voxVenv\Scripts\pip.exe" install -r "$voxTypeDir\requirements.txt" --no-cache-dir --quiet 2>&1 | Out-Null
 
 if (-not (Test-Path "$voxVenv\Lib\site-packages\PySide6")) { Fail "VoxType UI pip install failed" }
 if (-not (Test-Path "$voxVenv\Lib\site-packages\transformers")) { Fail "transformers install failed (STT backend)" }
-if (-not (Test-Path "$voxVenv\Lib\site-packages\optimum")) { Fail "optimum install failed (STT backend)" }
-if (-not (Test-Path "$voxVenv\Lib\site-packages\sherpa_onnx")) { Fail "sherpa-onnx install failed (TTS backend)" }
-Ok "Core deps installed (UI + STT via transformers+optimum + TTS via sherpa-onnx)"
+if (-not (Test-Path "$voxVenv\Lib\site-packages\kokoro")) { Fail "kokoro install failed (TTS backend)" }
+Ok "Core deps installed (UI + STT via transformers + TTS via kokoro, both on torch)"
 
-# GPU: sherpa-onnx uses ONNX Runtime under the hood for both engines.
-# Swap the CPU `onnxruntime` wheel (pulled in transitively) for
-# `onnxruntime-gpu` so device='cuda' actually lands on the GPU. Falls
-# back to CPU automatically at runtime if CUDA isn't usable.
-if ($GpuSupport) {
-    Write-Host "    pip install onnxruntime-gpu (replaces CPU onnxruntime for GPU inference)..." -ForegroundColor DarkGray
-    & "$voxVenv\Scripts\pip.exe" uninstall -y onnxruntime --quiet 2>&1 | Out-Null
-    & "$voxVenv\Scripts\pip.exe" install onnxruntime-gpu --no-cache-dir --quiet 2>&1 | Out-Null
-    if (Test-Path "$voxVenv\Lib\site-packages\onnxruntime") {
-        Ok "onnxruntime-gpu installed (STT + TTS will use CUDA when device='cuda')"
-    } else {
-        Warn "onnxruntime-gpu install failed — falling back to CPU inference"
-    }
-}
-
-# ─── Pre-download default models (idempotent + size-aware) ───────────
+# ─── Pre-download default models (idempotent) ────────────────────────
 #
-# Both downloads use huggingface_hub.snapshot_download with
-# allow_patterns filters so we only fetch the variants the engines
-# actually load — saves disk over pulling every quantization variant.
-#
-# STT: onnx-community/whisper-base-ONNX, q4f16 variant only (~85 MB).
-# TTS: csukuangfj/kokoro-multi-lang-v1_0, model + voices + lexicons
-#      (~270 MB minimal footprint).
+# STT: openai/whisper-base (~145 MB).
+# TTS: hexgrad/Kokoro-82M  (~327 MB).
 #
 # snapshot_download skips files already in the HF cache, so re-runs
 # are cheap. Errors are non-fatal: engines download lazily on first
@@ -155,64 +174,36 @@ if ($GpuSupport) {
 
 Step "Pre-downloading default models"
 
-Write-Host "    Fetching STT default (onnx-community/whisper-base-ONNX, q4f16 ~85 MB)..." -ForegroundColor DarkGray
+Write-Host "    Fetching STT default (openai/whisper-base, ~145 MB)..." -ForegroundColor DarkGray
 $rc_stt = & $voxPython -c @"
 import sys
 try:
     from huggingface_hub import snapshot_download
-    # Pull only what the engine loads. The fp32 / int8 / fp16 variants
-    # are NOT fetched — saves ~200 MB on disk.
-    p = snapshot_download(
-        repo_id='onnx-community/whisper-base-ONNX',
-        allow_patterns=[
-            '*.json',
-            'tokenizer*',
-            'merges.txt',
-            'vocab.json',
-            'onnx/encoder_model_q4f16.onnx',
-            'onnx/decoder_model_q4f16.onnx',
-            'onnx/decoder_with_past_model_q4f16.onnx',
-        ],
-    )
+    p = snapshot_download(repo_id='openai/whisper-base')
     print('STT cached at', p)
 except Exception as e:
     print('STT download skipped:', e, file=sys.stderr)
     sys.exit(1)
 "@ 2>&1
 if ($LASTEXITCODE -eq 0) {
-    Ok "STT default cached (whisper-base q4f16, ~85 MB)"
+    Ok "STT default cached (whisper-base, ~145 MB)"
 } else {
     Warn "STT model pre-download failed (will download lazily on first use): $rc_stt"
 }
 
-Write-Host "    Fetching TTS default (csukuangfj/kokoro-multi-lang-v1_0, ~270 MB)..." -ForegroundColor DarkGray
+Write-Host "    Fetching TTS default (hexgrad/Kokoro-82M, ~327 MB)..." -ForegroundColor DarkGray
 $rc_tts = & $voxPython -c @"
 import sys
 try:
     from huggingface_hub import snapshot_download
-    # Minimal Kokoro footprint: model + voices + tokens + lexicons +
-    # phonemizer data. Skips test WAVs and any oversized extras.
-    p = snapshot_download(
-        repo_id='csukuangfj/kokoro-multi-lang-v1_0',
-        allow_patterns=[
-            'model.onnx',
-            'voices.bin',
-            'tokens.txt',
-            'lexicon*.txt',
-            'dict/**',
-            'espeak-ng-data/**',
-            '*.fst',
-            'README.md',
-            'LICENSE',
-        ],
-    )
+    p = snapshot_download(repo_id='hexgrad/Kokoro-82M')
     print('TTS cached at', p)
 except Exception as e:
     print('TTS download skipped:', e, file=sys.stderr)
     sys.exit(1)
 "@ 2>&1
 if ($LASTEXITCODE -eq 0) {
-    Ok "TTS default cached (kokoro-multi-lang-v1_0, ~270 MB)"
+    Ok "TTS default cached (Kokoro-82M, ~327 MB)"
 } else {
     Warn "TTS model pre-download failed (will download lazily on first use): $rc_tts"
 }
@@ -291,16 +282,16 @@ Write-Host @"
   VoxType is running. Look for the tray icon (bottom-right).
   Press Ctrl+Win to dictate into any app.
 
-  STT and TTS run in-process via ONNX Runtime. Both are OFF until
-  you point them at a model in Settings > Services:
-    - STT model: HuggingFace repo ID (auto-downloads) or local
-      sherpa-onnx model directory.
-    - TTS model: HuggingFace repo ID or local .onnx file
-      (e.g. a Piper voice from rhasspy/piper-voices).
+  STT and TTS run in-process via PyTorch.
+    - STT: openai/whisper-base by default (any HF Whisper repo works).
+    - TTS: hexgrad/Kokoro-82M by default — 54 voices across 9 language
+      families. Voice names are strings like af_heart, jm_kumo, etc.
 
   External clients reach VoxType via the embedded HTTP server on
   http://127.0.0.1:6600 (OpenAI-compatible: /v1/audio/transcriptions
-  and /v1/audio/speech).
+  and /v1/audio/speech). The `model` / `voice` request fields are
+  accepted but ignored — VoxType decides the model + voice via its
+  own settings.
 
   LLM transcript cleanup is routed through telecode's proxy at
   http://127.0.0.1:1235. Make sure telecode is running for the

@@ -600,11 +600,11 @@ def _build_services(window) -> QWidget:
     from voxtype.stt_engine import DEFAULT_MODEL as _STT_DEFAULT
     s_body.addWidget(_row(_label("Model",
         "HuggingFace repo ID (auto-downloaded) or local path to a "
-        "sherpa-onnx model directory. Empty = use the built-in default "
+        "Whisper-family model. Empty = use the built-in default "
         "shown as placeholder."),
         _model_row("stt_model_path", _STT_DEFAULT)))
     s_body.addWidget(_row(_label("Device",
-        "CUDA falls back to CPU automatically if onnxruntime-gpu isn't available."),
+        "Falls back to CPU automatically if torch.cuda.is_available() is False."),
         _combo("stt_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))
     s_body.addWidget(_row(_label("Language",
         "ISO 639-1 code (en, de, ja, etc.). Leave 'en' for English."),
@@ -630,19 +630,23 @@ def _build_services(window) -> QWidget:
         _spin_idle("tts_idle_unload_sec")))
     from voxtype.tts_engine import DEFAULT_MODEL as _TTS_DEFAULT
     t_body.addWidget(_row(_label("Model",
-        "HuggingFace repo ID, repo+file path (e.g. "
-        "`rhasspy/piper-voices/en/.../voice.onnx`), or a local .onnx file. "
-        "The `.onnx.json` config sibling is auto-located. Empty = use the "
-        "built-in default shown as placeholder."),
+        "HuggingFace repo ID. Default = `hexgrad/Kokoro-82M` (54 voices, "
+        "9 language families). Empty = use the built-in default shown as "
+        "placeholder."),
         _model_row("tts_model_path", _TTS_DEFAULT)))
     t_body.addWidget(_row(_label("Device",
-        "CUDA falls back to CPU automatically if onnxruntime-gpu isn't available."),
+        "Falls back to CPU automatically if torch.cuda.is_available() is False."),
         _combo("tts_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))
-    t_body.addWidget(_row(_label("Speaker",
-        "Speaker index for multi-speaker models. 0 = default."),
-        _spin("tts_speaker", 0, 999)))
-    t_body.addWidget(_row(_label("Length Scale",
-        "Speech rate. >1.0 = slower. Most voices sound good at 1.0."),
+    t_body.addWidget(_row(_label("Voice",
+        "Kokoro voice name. Prefix encodes language + gender:\n"
+        " a{f,m}_*  American English  (af_heart, am_adam, …)\n"
+        " b{f,m}_*  British English   (bf_emma, bm_george, …)\n"
+        " e{f,m}_*  Spanish · f_  French · h_  Hindi · i_  Italian\n"
+        " j{f,m}_*  Japanese (jf_alpha, jm_kumo)\n"
+        " p{f,m}_*  Brazilian Portuguese · z{f,m}_*  Mandarin Chinese"),
+        _line_edit("tts_speaker")))
+    t_body.addWidget(_row(_label("Speed",
+        "Synthesis rate. 1.0 = normal, >1 = faster, <1 = slower."),
         _slider_float("tts_length_scale", 0.5, 2.0, 0.05, suffix="x")))
     t_body.addWidget(_lifecycle_row(
         "Load", "Unload", "Reload",

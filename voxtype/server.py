@@ -110,7 +110,9 @@ async def handle_transcribe(request: web.Request) -> web.Response:
 
     Accepts multipart form with:
       file:             audio blob (WAV/MP3/OGG/M4A/...)
-      model:            ignored (engine model is set in VoxType settings)
+      model:            accepted but ignored. VoxType controls the model
+                        through its own settings — external clients
+                        only address the server by host:port.
       language:         ISO code, default "en"
       response_format:  "json" (default) or "text"
     """
@@ -134,7 +136,9 @@ async def handle_transcribe(request: web.Request) -> web.Response:
         elif part.name == "response_format":
             response_format = (await part.text()).strip() or "json"
         else:
-            # Drain unknown parts so the reader advances.
+            # Drain unknown parts so the reader advances. Includes
+            # `model` — accepted for OpenAI API compatibility but
+            # ignored (VoxType picks the model from its settings).
             await part.read(decode=False)
     if not audio_bytes:
         raise web.HTTPBadRequest(reason="missing 'file' field")
@@ -159,9 +163,12 @@ async def handle_speech(request: web.Request) -> web.Response:
     """POST /v1/audio/speech — OpenAI-compatible TTS.
 
     Accepts JSON body with:
-      model:           ignored (the loaded ONNX file IS the model)
+      model:           accepted but ignored. VoxType controls the model
+                       through its own settings — external clients only
+                       address the server by host:port.
       input:           text to synthesize
-      voice:           ignored — the loaded model file IS the voice
+      voice:           accepted but ignored. The TTS voice is configured
+                       in VoxType settings (`tts_speaker`).
       speed:           float, default 1.0 (>1 = faster)
       response_format: "wav" (default; we serve WAV natively)
     """
@@ -172,14 +179,13 @@ async def handle_speech(request: web.Request) -> web.Response:
     text = str(body.get("input") or "").strip()
     if not text:
         raise web.HTTPBadRequest(reason="missing 'input'")
-    voice = body.get("voice")
     speed_val: Any = body.get("speed")
     try:
         speed = float(speed_val) if speed_val is not None else None
     except (TypeError, ValueError):
         speed = None
     try:
-        wav_bytes = await tts_engine.get_engine().synthesize(text, voice=voice, speed=speed)
+        wav_bytes = await tts_engine.get_engine().synthesize(text, speed=speed)
     except Exception as exc:
         log.error("speech: engine failed: %s", exc)
         return web.json_response({"error": str(exc)}, status=500)

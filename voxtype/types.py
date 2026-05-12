@@ -1,8 +1,8 @@
 """Settings + UI state types. Single source of truth.
 
-STT and TTS both run in-process via ONNX Runtime. An embedded HTTP
-server (single port, default 6600) exposes them to external clients
-via OpenAI-compatible endpoints — see voxtype/server.py.
+STT and TTS both run in-process via PyTorch. An embedded HTTP server
+(single port, default 6600) exposes them to external clients via
+OpenAI-compatible endpoints — see voxtype/server.py.
 """
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from typing import Literal
 
 PillState = Literal["idle", "recording", "processing", "enhancing", "typing", "error"]
 HotkeyMode = Literal["hold", "toggle"]
-# ONNX Runtime provider preference. Used by both STT and TTS.
-OnnxDevice = Literal["cpu", "cuda"]
+# torch device preference. Used by both STT and TTS engines.
+TorchDevice = Literal["cpu", "cuda"]
 
 
 @dataclass
@@ -48,36 +48,33 @@ class AppSettings:
     server_enabled: bool = True
     server_port: int = 6600
 
-    # ── STT (in-process via ONNX Runtime + transformers/optimum) ────
+    # ── STT (in-process via transformers + torch) ───────────────────
     # `stt_model_path` accepts a HF repo ID (auto-downloaded) or a local
-    # path. Default = `onnx-community/whisper-base-ONNX` loaded with the
-    # q4f16 quantization variant: ~85 MB total, 99-language multilingual,
-    # 4-bit weights with fp16 activations preserving attention accuracy.
-    # Empty field falls back to DEFAULT_MODEL in stt_engine.
+    # path. Default = `openai/whisper-base`: 99-language multilingual,
+    # ~145 MB on disk. Any HF Whisper-family repo works (distilled,
+    # large, fine-tunes). Empty field falls back to DEFAULT_MODEL in
+    # stt_engine.
     stt_enabled: bool = True
     stt_auto_start: bool = True
     stt_idle_unload_sec: int = 300
-    stt_model_path: str = "onnx-community/whisper-base-ONNX"
-    stt_device: OnnxDevice = "cpu"
+    stt_model_path: str = "openai/whisper-base"
+    stt_device: TorchDevice = "cpu"
     stt_language: str = "en"
-    # ONNX variant suffix used by onnx-community repos. Pick from:
-    #   q4f16 (default, smallest accurate) · q4 · int8 · fp16 · fp32 ('')
-    stt_quant: str = "q4f16"
 
-    # ── TTS (in-process via sherpa-onnx Kokoro) ─────────────────────
-    # `tts_model_path` accepts a HF repo ID (auto-downloaded) or a local
-    # path. Default = `csukuangfj/kokoro-multi-lang-v1_0`: 53 voices in
-    # one model, English + Chinese, ~270 MB minimal footprint. Empty
-    # falls back to DEFAULT_MODEL in tts_engine.
+    # ── TTS (in-process via kokoro PyPI package + torch) ────────────
+    # `tts_model_path` accepts a HF repo ID. Default = `hexgrad/Kokoro-82M`:
+    # 54 voices across 9 language families (American + British English,
+    # Spanish, French, Hindi, Italian, Japanese, Brazilian Portuguese,
+    # Mandarin Chinese), ~327 MB on disk.
+    # `tts_speaker` is a voice NAME (string), not an index. Examples:
+    #   af_heart, am_adam, bf_emma, bm_george, jm_kumo, zf_xiaobei.
     tts_enabled: bool = False
     tts_auto_start: bool = False
     tts_idle_unload_sec: int = 600
-    tts_model_path: str = "csukuangfj/kokoro-multi-lang-v1_0"
-    tts_device: OnnxDevice = "cpu"
-    tts_speaker: int = 0               # speaker index for multi-speaker models
-    tts_length_scale: float = 1.0      # >1 = slower; OpenAI speed is its inverse
-    tts_noise_scale: float = 0.667
-    tts_noise_w: float = 0.8
+    tts_model_path: str = "hexgrad/Kokoro-82M"
+    tts_device: TorchDevice = "cpu"
+    tts_speaker: str = "af_heart"
+    tts_length_scale: float = 1.0      # Kokoro `speed` arg (1.0 = normal)
 
     # ── LLM enhancement (via telecode proxy) ─────────────────────────
     enhance_enabled: bool = True

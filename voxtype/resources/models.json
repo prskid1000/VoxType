@@ -16,7 +16,13 @@
     {"name": "MMS 1B FL102",                 "model": "facebook/mms-1b-fl102"},
     {"name": "SeamlessM4T v2 Large",         "model": "facebook/seamless-m4t-v2-large"},
     {"name": "SeamlessM4T Medium",           "model": "facebook/hf-seamless-m4t-medium"},
-    {"name": "SpeechT5 ASR",                 "model": "microsoft/speecht5_asr"}
+    {"name": "SpeechT5 ASR",                 "model": "microsoft/speecht5_asr"},
+    {"name": "Voxtral Mini 3B (Mistral)",    "model": "mistralai/Voxtral-Mini-3B-2507"},
+    {"name": "Voxtral Small 24B",            "model": "mistralai/Voxtral-Small-24B-2507"},
+    {"name": "Granite Speech 3.3 8B",        "model": "ibm-granite/granite-speech-3.3-8b"},
+    {"name": "Granite Speech 3.3 2B",        "model": "ibm-granite/granite-speech-3.3-2b"},
+    {"name": "Phi-4 Multimodal",             "model": "microsoft/Phi-4-multimodal-instruct"},
+    {"name": "Qwen2-Audio 7B Instruct",      "model": "Qwen/Qwen2-Audio-7B-Instruct"}
   ],
   "tts": [
     {"name": "Kokoro 82M (default)",         "model": "hexgrad/Kokoro-82M",                 "default_voice": "af_heart"},
@@ -30,6 +36,10 @@
     {"name": "Bark (small)",                 "model": "suno/bark-small",                    "default_voice": "v2/en_speaker_6"},
     {"name": "Bark",                         "model": "suno/bark",                          "default_voice": "v2/en_speaker_6"},
     {"name": "Parler Mini v1",               "model": "parler-tts/parler-tts-mini-v1",      "default_voice": "calm-male"},
-    {"name": "Parler Large v1",              "model": "parler-tts/parler-tts-large-v1",     "default_voice": "calm-male"}
+    {"name": "Parler Large v1",              "model": "parler-tts/parler-tts-large-v1",     "default_voice": "calm-male"},
+    {"name": "Orpheus 3B 0.1 (English)",     "model": "canopylabs/orpheus-3b-0.1-ft",       "default_voice": "tara"},
+    {"name": "CSM 1B (Sesame)",              "model": "sesame/csm-1b",                      "default_voice": "conversational"},
+    {"name": "Higgs-Audio v2 3B",            "model": "bosonai/higgs-audio-v2-generation-3B-base", "default_voice": "zero-shot"},
+    {"name": "VibeVoice 1.5B",               "model": "microsoft/VibeVoice-1.5B",           "default_voice": "default"}
   ]
 }

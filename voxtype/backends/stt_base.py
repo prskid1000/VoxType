@@ -24,6 +24,7 @@ class LoadConfig:
     dtype: str             # "auto" | "fp32" | "fp16" | "bf16"
     warmup: bool           # run a dummy inference after load
     torch_compile: bool    # JIT compile the model where supported
+    attn_impl: str = "auto"  # "auto" | "sdpa" | "flash_attention_2" | "eager"
 
 
 @dataclass

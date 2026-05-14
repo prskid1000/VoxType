@@ -1,8 +1,8 @@
-"""TTS engine orchestrator — owns lifecycle, delegates to a backend.
+"""TTS engine orchestrator — owns lifecycle, delegates to the generic
+backend.
 
-The actual synthesis is done by a swappable
-`voxtype.backends.TTSBackend` instance (the generic backend in normal
-use). This module handles:
+Synthesis is done by `GenericTTSBackend`, which auto-dispatches by
+model family. This module handles:
   - load / unload locking
   - idle-unload watcher
   - status listeners
@@ -10,9 +10,6 @@ use). This module handles:
   - rebuild-on-config-change via `_key()`
 
 Per-family options live in `settings.tts_opts` (a free-form dict).
-The universal `tts_voice` and `tts_speed` are first-class fields on
-AppSettings; everything else (style prompts, speaker embeddings,
-sampling temperature, reference audio for cloning) lives in tts_opts.
 """
 from __future__ import annotations
 
@@ -26,9 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from voxtype.backends import (
-    get_tts_backend, resolve_tts_backend, tts_backend_names,
-)
+from voxtype.backends import get_tts_backend
 from voxtype.backends.tts_base import TTSBackend, TTSLoadConfig
 
 log = logging.getLogger("voxtype.tts_engine")
@@ -38,48 +33,12 @@ DEFAULT_MODEL = "hexgrad/Kokoro-82M"
 DEFAULT_VOICE = "af_heart"
 
 
-def available_backends() -> list[str]:
-    return tts_backend_names()
-
-
-def _safe_backend(name: str = "generic") -> TTSBackend | None:
-    try:
-        return get_tts_backend(name)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("tts backend %r unavailable: %s", name, exc)
-        return None
-
-
-def voice_combo_options(backend_name: str | None = None) -> list[tuple[str, str]]:
-    """Voice catalog from a NOT-yet-loaded backend instance. For the
-    generic backend this returns an empty list pre-load; the UI shows
-    a placeholder and rebuilds the picker once the model loads."""
-    be = _safe_backend(backend_name or "generic")
-    return be.voice_combo_options() if be else []
-
-
-def all_voice_ids(backend_name: str | None = None) -> set[str]:
-    be = _safe_backend(backend_name or "generic")
-    return be.voice_ids() if be else set()
-
-
-def default_voice_for(backend_name: str) -> str:
-    be = _safe_backend(backend_name)
-    return be.default_voice if be else DEFAULT_VOICE
-
-
-def default_model_for(backend_name: str) -> str:
-    be = _safe_backend(backend_name)
-    return be.default_model if be else DEFAULT_MODEL
-
-
 @dataclass
 class TTSStatus:
     running: bool = False
     ready: bool = False
     pid: int | None = None
     last_error: str = ""
-    backend: str = ""
     family: str = ""
 
     @property
@@ -92,7 +51,6 @@ class TTSEngine:
 
     def __init__(self) -> None:
         self._backend: TTSBackend | None = None
-        self._backend_name: str = ""
         self._model_lock = asyncio.Lock()
         self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxtype-tts")
         self._loaded_key: tuple | None = None
@@ -108,7 +66,9 @@ class TTSEngine:
         self._speed = 1.0
         self._warmup = True
         self._torch_compile = False
+        self._attn_impl = "auto"
         self._stream_default = False
+        self._seed = -1
         self._opts: dict[str, Any] = {}
 
     # ── Listener wiring ──────────────────────────────────────────────
@@ -128,7 +88,6 @@ class TTSEngine:
             ready=self._status.ready,
             pid=None,
             last_error=self._status.last_error,
-            backend=self._backend_name,
             family=family,
         )
 
@@ -145,17 +104,13 @@ class TTSEngine:
     # ── Configuration ────────────────────────────────────────────────
 
     def _effective_model(self) -> str:
-        if self._model_path:
-            return self._model_path
-        if self._backend is not None:
-            return self._backend.default_model
-        return DEFAULT_MODEL
+        return self._model_path or DEFAULT_MODEL
 
     def _effective_voice(self) -> str:
         """Validate voice against the loaded backend's catalog. If the
-        catalog is empty (generic backend pre-load), accept the user
-        value as-is — the family handler will fall back to its default
-        when the catalog appears."""
+        catalog is empty (pre-load), accept the user value as-is — the
+        family handler falls back to its default when the catalog
+        appears."""
         v = (self._voice or "").strip()
         be = self._backend
         if be is None:
@@ -169,20 +124,20 @@ class TTSEngine:
 
     def _key(self) -> tuple:
         return (
-            "generic",
             self._effective_model(), self._device,
-            bool(self._torch_compile),
+            bool(self._torch_compile), self._attn_impl,
         )
 
     async def configure(self, s) -> None:
-        self._backend_name = "generic"
         self._model_path = str(getattr(s, "tts_model_path", "") or "")
         self._device = str(getattr(s, "tts_device", "cpu"))
         self._voice = str(getattr(s, "tts_voice", "") or "")
         self._speed = float(getattr(s, "tts_speed", 1.0) or 1.0)
         self._warmup = bool(getattr(s, "tts_warmup", True))
         self._torch_compile = bool(getattr(s, "tts_torch_compile", False))
+        self._attn_impl = str(getattr(s, "tts_attn_impl", "auto") or "auto")
         self._stream_default = bool(getattr(s, "tts_stream", False))
+        self._seed = int(getattr(s, "tts_seed", -1))
         self._idle_unload_sec = int(getattr(s, "tts_idle_unload_sec", 0))
         opts = getattr(s, "tts_opts", {}) or {}
         self._opts = dict(opts) if isinstance(opts, dict) else {}
@@ -213,9 +168,8 @@ class TTSEngine:
 
     async def _do_load_locked(self) -> None:
         model_id = self._effective_model()
-        backend = resolve_tts_backend(model_id)
-        log.info("tts loading backend=%s model=%s device=%s",
-                 backend.name, model_id, self._device)
+        backend = get_tts_backend()
+        log.info("tts loading model=%s device=%s", model_id, self._device)
         self._status.last_error = ""
         self._status.running = False
         self._status.ready = False
@@ -226,17 +180,17 @@ class TTSEngine:
             device=self._device,
             warmup=self._warmup,
             torch_compile=self._torch_compile,
+            attn_impl=self._attn_impl,
         )
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(self._exec, backend.load_sync, cfg)
             self._backend = backend
-            self._backend_name = backend.name
             self._loaded_key = self._key()
             self._status.running = True
             self._status.ready = True
             self._last_used = time.monotonic()
-            log.info("tts ready (backend=%s %s)", backend.name, backend.runtime_info())
+            log.info("tts ready (%s)", backend.runtime_info())
             self._notify()
             self._ensure_idle_watcher()
         except Exception as exc:  # noqa: BLE001
@@ -256,7 +210,7 @@ class TTSEngine:
     async def _do_unload_locked(self) -> None:
         if self._backend is None:
             return
-        log.info("tts unloading backend=%s", self._backend_name)
+        log.info("tts unloading")
         be = self._backend
         self._backend = None
         self._loaded_key = None
@@ -277,30 +231,30 @@ class TTSEngine:
         if not v:
             v = self._effective_voice()
         else:
-            # Per-call override — accept any catalog match, otherwise
-            # fall back to the configured default.
             be = self._backend
             if be is not None:
                 ids = be.voice_ids()
                 if ids and v not in ids:
                     log.debug("tts: per-call voice %r unknown — using default", v)
                     v = self._effective_voice()
-        # Speed only applies if the backend honours it.
         be = self._backend
         supports_speed = be.supports("speed") if be is not None else True
         spd = (float(speed) if (speed and speed > 0)
                else float(self._speed or 1.0))
         if not supports_speed:
             spd = 1.0
-        # Per-call opts = configured family-specific opts + speed key.
         opts = dict(self._opts)
         opts["speed"] = spd
+        # Universal seed: only forwarded to families that consume it.
+        # Per-family `seed` (e.g. VITS) overrides the universal value.
+        if self._seed != -1 and "seed" not in opts:
+            opts["seed"] = int(self._seed)
         # Filter against backend's runtime spec when available, so
         # stale keys from a different family don't leak through.
         if be is not None:
             specs = be.runtime_options()
             if specs:
-                allowed = {"speed"} | {s.key for s in specs}
+                allowed = {"speed", "seed"} | {s.key for s in specs}
                 opts = {k: opts[k] for k in opts if k in allowed}
         return v, opts
 

@@ -21,12 +21,22 @@
     Which CUDA wheel index to use when -GpuSupport is on. Accepts
     "cu130" (CUDA 13, nightly), "cu124" (CUDA 12.4 stable, recommended
     if you don't have CUDA 13 installed), or "cpu". Default cu130.
+.PARAMETER FlashAttn
+    Attempt to install Flash-Attention 2 for ~1.5-2x speedup on
+    Whisper / Voxtral / Seamless inference. Requires fp16/bf16 +
+    Ampere+ (RTX 30xx / A100+). On Windows there are no official
+    PyPI wheels, so we sniff the venv's torch+CUDA+python triple and
+    auto-fetch a matching prebuilt wheel from
+    lldacing/flash-attention-windows-wheel. Falls through with a
+    clear warning when no wheel matches or the GPU isn't supported.
+    Default `$true` — pass `-FlashAttn $false` to skip.
 #>
 param(
     [string]$InstallDir   = "$env:USERPROFILE\.voxtype",
     [bool]  $GpuSupport   = $true,
     [ValidateSet("cu130", "cu124", "cpu")]
-    [string]$CudaVersion  = "cu130"
+    [string]$CudaVersion  = "cu130",
+    [bool]  $FlashAttn    = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -169,6 +179,113 @@ if (-not (Test-Path "$voxVenv\Lib\site-packages\PySide6")) { Fail "VoxType UI pi
 if (-not (Test-Path "$voxVenv\Lib\site-packages\transformers")) { Fail "transformers install failed (whisper backend)" }
 if (-not (Test-Path "$voxVenv\Lib\site-packages\kokoro")) { Fail "kokoro install failed (kokoro TTS backend)" }
 Ok "Core deps installed (UI + STT via whisper + TTS via kokoro, both on torch)"
+
+# ─── Flash-Attention 2 (Windows-aware installer, on by default) ──────
+if ($FlashAttn -and -not $GpuSupport) {
+    Warn "Flash-Attention 2 needs CUDA — skipping (you passed -GpuSupport `$false)."
+}
+elseif ($FlashAttn) {
+    Step "Installing Flash-Attention 2 (pass -FlashAttn `$false to skip)"
+
+    # Sniff the running venv's torch + CUDA + python triple so we can
+    # pick a prebuilt wheel that actually links. PyPI's flash-attn has
+    # no Windows wheels — we use lldacing's release repo instead.
+    $probe = @"
+import json, sys, torch
+out = {
+    "py":    f"cp{sys.version_info.major}{sys.version_info.minor}",
+    "torch": torch.__version__.split("+")[0],
+    "cuda":  (torch.version.cuda or "").replace(".", "") if torch.cuda.is_available() else "",
+}
+print(json.dumps(out))
+"@
+    $probeJson = & $voxPython -c $probe 2>$null
+    $env_ok = $false
+    try {
+        $env = $probeJson | ConvertFrom-Json
+        $env_ok = ($env.py -and $env.torch -and $env.cuda)
+    } catch { $env_ok = $false }
+
+    if (-not $env_ok) {
+        Warn "Couldn't probe torch/CUDA versions — skipping flash-attn install. Make sure torch is installed first."
+    } else {
+        $py = $env.py; $tv = $env.torch; $cu = "cu" + $env.cuda
+        Write-Host "    Detected: python=$py, torch=$tv, cuda=$cu" -ForegroundColor DarkGray
+        Write-Host "    Querying lldacing/flash-attention-windows-wheel release index..." -ForegroundColor DarkGray
+
+        $resolve = @"
+import json, sys, urllib.request
+PY, TORCH, CUDA = "$py", "$tv", "$cu"
+url = "https://api.github.com/repos/lldacing/flash-attention-windows-wheel/releases?per_page=30"
+req = urllib.request.Request(url, headers={"Accept":"application/json", "User-Agent":"voxtype-setup/1.0"})
+try:
+    with urllib.request.urlopen(req, timeout=15) as r:
+        releases = json.loads(r.read().decode("utf-8"))
+except Exception as e:
+    print(f"ERROR query failed: {e}")
+    sys.exit(1)
+# Search every release's assets for a wheel matching our triple.
+needle_torch = TORCH.rsplit(".dev", 1)[0].rsplit("+", 1)[0]
+# Wheels follow pattern: flash_attn-X+cuYYYtorchZ.Z.Zcxx11abiFALSE-cpPP-cpPP-win_amd64.whl
+hit = None
+for rel in releases:
+    for a in rel.get("assets", []):
+        n = a.get("name", "")
+        if not n.endswith("-win_amd64.whl"): continue
+        if CUDA not in n: continue
+        if f"torch{needle_torch}" not in n: continue
+        if f"-{PY}-" not in n: continue
+        hit = (n, a.get("browser_download_url"))
+        break
+    if hit: break
+if not hit:
+    # Soften: any matching torch + CUDA + python, even if minor differs.
+    for rel in releases:
+        for a in rel.get("assets", []):
+            n = a.get("name", "")
+            if not n.endswith("-win_amd64.whl"): continue
+            if CUDA not in n: continue
+            if f"-{PY}-" not in n: continue
+            if "torch" + needle_torch.rsplit(".", 1)[0] in n:
+                hit = (n, a.get("browser_download_url"))
+                break
+        if hit: break
+if not hit:
+    print("ERROR no matching wheel")
+    sys.exit(2)
+print(hit[1])
+"@
+        $wheelUrl = & $voxPython -c $resolve 2>&1
+        if ($LASTEXITCODE -ne 0 -or $wheelUrl -like "ERROR*") {
+            Warn "Couldn't find a matching flash-attn wheel for python=$py torch=$tv $cu."
+            Warn "Browse the release page manually:"
+            Warn "  https://github.com/lldacing/flash-attention-windows-wheel/releases"
+            Warn "Download a wheel matching your torch/CUDA/python and run:"
+            Warn "  & '$voxVenv\Scripts\pip.exe' install <wheel.whl>"
+        } else {
+            $wheelUrl = ($wheelUrl | Select-Object -Last 1).ToString().Trim()
+            $wheelFile = Join-Path $env:TEMP (Split-Path -Leaf $wheelUrl)
+            Write-Host "    Downloading $($wheelFile | Split-Path -Leaf)..." -ForegroundColor DarkGray
+            try {
+                Invoke-WebRequest -Uri $wheelUrl -OutFile $wheelFile -UseBasicParsing
+                Write-Host "    pip install $($wheelFile | Split-Path -Leaf)..." -ForegroundColor DarkGray
+                & "$voxVenv\Scripts\pip.exe" install $wheelFile --no-cache-dir --quiet 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0 -and (Test-Path "$voxVenv\Lib\site-packages\flash_attn")) {
+                    Ok "flash-attn installed — Settings -> Attention -> 'flash_attention_2' is now functional"
+                } else {
+                    Warn "Wheel downloaded but pip install failed. Check the install log."
+                }
+            } catch {
+                Warn "Download / install failed: $($_.Exception.Message)"
+                Warn "Manual fallback: download from"
+                Warn "  $wheelUrl"
+                Warn "then run: & '$voxVenv\Scripts\pip.exe' install <wheel.whl>"
+            } finally {
+                if (Test-Path $wheelFile) { Remove-Item $wheelFile -Force -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+}
 
 # ─── Pre-download default models (idempotent) ────────────────────────
 #

@@ -44,6 +44,7 @@ class _BaseTTSHandler:
         self._model: Any = None
         self._processor: Any = None
         self._torch_device: str = "cpu"
+        self._attn_impl: str = "auto"
 
     def _resolve_device(self, cfg: TTSLoadConfig) -> bool:
         import torch
@@ -51,7 +52,33 @@ class _BaseTTSHandler:
         if cfg.device == "cuda" and not on_cuda:
             log.warning("%s: cuda requested but unavailable — using CPU", self.family)
         self._torch_device = "cuda" if on_cuda else "cpu"
+        self._attn_impl = (cfg.attn_impl or "auto").lower()
         return on_cuda
+
+    def _attn_kwargs(self) -> dict[str, Any]:
+        if self._attn_impl in {"sdpa", "flash_attention_2", "eager"}:
+            return {"attn_implementation": self._attn_impl}
+        return {}
+
+    def _seed_rng(self, opts: dict[str, Any]) -> None:
+        """Apply the per-call `seed` opt (or universal seed via engine).
+        Called at the top of each synth() before sampling."""
+        seed = opts.get("seed")
+        if seed is None:
+            return
+        try:
+            s = int(seed)
+        except Exception:
+            return
+        if s < 0:
+            return
+        try:
+            import torch
+            torch.manual_seed(s)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(s)
+        except Exception:
+            pass
 
     def load(self, cfg: TTSLoadConfig) -> None:  # pragma: no cover
         raise NotImplementedError
@@ -152,9 +179,17 @@ class _KokoroHandler(_BaseTTSHandler):
     def synth(self, text: str, voice: str,
               opts: dict[str, Any]) -> Iterator[bytes]:
         import torch
-        v = voice or "af_heart"
+        # Voice blend overrides the picked voice when provided.
+        blend = str(opts.get("voice_blend") or "").strip()
+        v: Any = blend if blend else (voice or "af_heart")
         speed = float(opts.get("speed") or 1.0)
-        for _, _, audio in self._model(text, voice=v, speed=speed):
+        try:
+            iterator = self._model(text, voice=v, speed=speed)
+        except (TypeError, ValueError) as exc:
+            log.warning("kokoro: voice spec %r rejected (%s); falling "
+                        "back to default", v, exc)
+            iterator = self._model(text, voice="af_heart", speed=speed)
+        for _, _, audio in iterator:
             if audio is None:
                 continue
             if isinstance(audio, torch.Tensor):
@@ -182,11 +217,12 @@ class _VitsHandler(_BaseTTSHandler):
     sample_rate = 16000   # MMS-TTS is 16k; pure VITS varies — we read it post-load
 
     def load(self, cfg: TTSLoadConfig) -> None:
-        import torch
         from transformers import VitsModel, AutoTokenizer
         self._resolve_device(cfg)
         self._processor = AutoTokenizer.from_pretrained(cfg.model_id)
-        self._model = VitsModel.from_pretrained(cfg.model_id).to(self._torch_device)
+        self._model = VitsModel.from_pretrained(
+            cfg.model_id, **self._attn_kwargs(),
+        ).to(self._torch_device)
         self._model.eval()
         # VITS exposes the SR via model.config.sampling_rate
         try:
@@ -203,14 +239,26 @@ class _VitsHandler(_BaseTTSHandler):
     def synth(self, text: str, voice: str,
               opts: dict[str, Any]) -> Iterator[bytes]:
         import torch
-        # VITS honours speed via speaking_rate / noise_scale; transformers'
-        # VitsModel exposes them on the model itself.
+        self._seed_rng(opts)
+        # Speed in VITS is the inverse of `speaking_rate`. Universal
+        # `speed` is forwarded by the engine; we map it onto the model.
         speed = float(opts.get("speed") or 1.0)
         try:
-            # speaking_rate is inverse — bigger = faster
             self._model.speaking_rate = speed
         except Exception:
             pass
+        noise = opts.get("noise_scale")
+        if noise is not None:
+            try:
+                self._model.noise_scale = float(noise)
+            except Exception:
+                pass
+        ndur = opts.get("noise_scale_duration")
+        if ndur is not None:
+            try:
+                self._model.noise_scale_duration = float(ndur)
+            except Exception:
+                pass
         inputs = self._processor(text=text, return_tensors="pt").to(self._torch_device)
         with torch.no_grad():
             out = self._model(**inputs).waveform
@@ -247,7 +295,7 @@ class _SpeechT5Handler(_BaseTTSHandler):
         self._resolve_device(cfg)
         self._processor = SpeechT5Processor.from_pretrained(cfg.model_id)
         self._model = SpeechT5ForTextToSpeech.from_pretrained(
-            cfg.model_id,
+            cfg.model_id, **self._attn_kwargs(),
         ).to(self._torch_device)
         self._vocoder = SpeechT5HifiGan.from_pretrained(
             "microsoft/speecht5_hifigan",
@@ -337,7 +385,9 @@ class _BarkHandler(_BaseTTSHandler):
         from transformers import BarkModel, AutoProcessor
         self._resolve_device(cfg)
         self._processor = AutoProcessor.from_pretrained(cfg.model_id)
-        self._model = BarkModel.from_pretrained(cfg.model_id).to(self._torch_device)
+        self._model = BarkModel.from_pretrained(
+            cfg.model_id, **self._attn_kwargs(),
+        ).to(self._torch_device)
         self._model.eval()
         try:
             self.sample_rate = int(self._model.generation_config.sample_rate)
@@ -347,13 +397,28 @@ class _BarkHandler(_BaseTTSHandler):
     def synth(self, text: str, voice: str,
               opts: dict[str, Any]) -> Iterator[bytes]:
         import torch
+        self._seed_rng(opts)
         v = voice or "v2/en_speaker_6"
         inputs = self._processor(text, voice_preset=v).to(self._torch_device)
         gen: dict = {"do_sample": True}
-        temp = opts.get("temperature")
-        if temp is not None:
+        # Bark exposes three temperatures (semantic / coarse / fine).
+        # The HF wrapper takes them as separate generate() kwargs.
+        sem = opts.get("semantic_temperature")
+        if sem is not None:
             try:
-                gen["temperature"] = float(temp)
+                gen["semantic_temperature"] = float(sem)
+            except Exception:
+                pass
+        crs = opts.get("coarse_temperature")
+        if crs is not None:
+            try:
+                gen["coarse_temperature"] = float(crs)
+            except Exception:
+                pass
+        eos = opts.get("min_eos_p")
+        if eos is not None:
+            try:
+                gen["min_eos_p"] = float(eos)
             except Exception:
                 pass
         with torch.no_grad():
@@ -393,7 +458,7 @@ class _ParlerHandler(_BaseTTSHandler):
         self._resolve_device(cfg)
         self._tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
         self._model = ParlerTTSForConditionalGeneration.from_pretrained(
-            cfg.model_id,
+            cfg.model_id, **self._attn_kwargs(),
         ).to(self._torch_device)
         self._model.eval()
         try:
@@ -404,19 +469,39 @@ class _ParlerHandler(_BaseTTSHandler):
     def synth(self, text: str, voice: str,
               opts: dict[str, Any]) -> Iterator[bytes]:
         import torch
+        self._seed_rng(opts)
         # Parler conditions on a *style description*. Voice id maps to
         # one of our presets; the per-call `style` opt overrides it.
+        # The model receives it as `input_ids` (style) + `prompt_input_ids`
+        # (text). Parler's own code names this argument `description`,
+        # but the underlying generate() call uses `input_ids`.
         style = str(opts.get("style") or "")
         if not style:
             style = dict(_PARLER_PRESETS).get(voice or "calm-male",
                                                "A clear, neutral voice.")
         inputs = self._tokenizer(style, return_tensors="pt").to(self._torch_device)
         prompts = self._tokenizer(text, return_tensors="pt").to(self._torch_device)
+        gen: dict[str, Any] = {
+            "input_ids": inputs.input_ids,
+            "prompt_input_ids": prompts.input_ids,
+        }
+        temp = opts.get("temperature")
+        if temp is not None:
+            try:
+                t = float(temp)
+                if t > 0.0:
+                    gen["do_sample"] = True
+                    gen["temperature"] = t
+            except Exception:
+                pass
+        mnt = opts.get("max_new_tokens")
+        if mnt is not None:
+            try:
+                gen["max_new_tokens"] = int(mnt)
+            except Exception:
+                pass
         with torch.no_grad():
-            out = self._model.generate(
-                input_ids=inputs.input_ids,
-                prompt_input_ids=prompts.input_ids,
-            )
+            out = self._model.generate(**gen)
         arr = out.cpu().to(torch.float32).numpy().squeeze()
         yield self._to_int16_bytes(arr)
 
@@ -426,6 +511,283 @@ class _ParlerHandler(_BaseTTSHandler):
 
     def default_voice(self) -> str:
         return "calm-male"
+
+
+# ── XTTS (Coqui) — voice cloning ─────────────────────────────────────
+
+
+class _XTTSHandler(_BaseTTSHandler):
+    family = fd.TTS_XTTS
+    sample_rate = 24000
+
+    def load(self, cfg: TTSLoadConfig) -> None:
+        # Coqui's `TTS` PyPI package. Non-commercial license. If missing,
+        # the dispatcher retries with the pipeline fallback (which will
+        # fail too — XTTS isn't HF-pipeline-compatible).
+        from TTS.api import TTS as _CoquiTTS
+        self._resolve_device(cfg)
+        self._model = _CoquiTTS(model_name=cfg.model_id, progress_bar=False)
+        if self._torch_device == "cuda":
+            try:
+                self._model = self._model.to("cuda")
+            except Exception:
+                pass
+        try:
+            self.sample_rate = int(
+                self._model.synthesizer.output_sample_rate)
+        except Exception:
+            pass
+
+    def synth(self, text: str, voice: str,
+              opts: dict[str, Any]) -> Iterator[bytes]:
+        ref = str(opts.get("reference_audio") or "").strip()
+        if not ref:
+            raise RuntimeError(
+                "XTTS requires a reference audio path "
+                "(set tts_opts.reference_audio)")
+        lang = str(opts.get("language") or "en")
+        speed = float(opts.get("speed") or 1.0)
+        kw: dict[str, Any] = {
+            "text": text, "speaker_wav": ref, "language": lang,
+            "speed": speed,
+        }
+        # XTTS exposes these on `tts()` as keyword args in Coqui ≥ 0.22.
+        for key in ("temperature", "top_p", "top_k",
+                     "repetition_penalty", "length_penalty"):
+            if key in opts and opts[key] is not None:
+                try:
+                    kw[key] = (int(opts[key])
+                                if key == "top_k"
+                                else float(opts[key]))
+                except Exception:
+                    pass
+        arr = self._model.tts(**kw)
+        yield self._to_int16_bytes(np.asarray(arr, dtype=np.float32))
+
+    def voices(self) -> list[VoiceEntry]:
+        return [VoiceEntry("clone", "any", "", "Clone from Reference WAV")]
+
+    def default_voice(self) -> str:
+        return "clone"
+
+
+# ── Orpheus-TTS — Llama backbone + SNAC vocoder ──────────────────────
+
+
+class _OrpheusHandler(_BaseTTSHandler):
+    family = fd.TTS_ORPHEUS
+    sample_rate = 24000
+
+    def load(self, cfg: TTSLoadConfig) -> None:
+        # Orpheus loads via standard transformers (Llama backbone)
+        # plus a separate SNAC vocoder. The orpheus-speech PyPI package
+        # ships a wrapper; we try it first, then fall back to a manual
+        # AutoModelForCausalLM + snac setup.
+        from orpheus_tts import OrpheusModel
+        self._resolve_device(cfg)
+        self._model = OrpheusModel(
+            model_name=cfg.model_id,
+            device=self._torch_device,
+            dtype="bfloat16" if self._torch_device == "cuda" else "float32",
+        )
+
+    def synth(self, text: str, voice: str,
+              opts: dict[str, Any]) -> Iterator[bytes]:
+        self._seed_rng(opts)
+        emo = str(opts.get("emotion_tags") or "").strip()
+        if emo:
+            tags = " ".join(f"<{t.strip().strip('<>')}>"
+                             for t in emo.split(",") if t.strip())
+            text = f"{tags} {text}"
+        kw: dict[str, Any] = {
+            "prompt": text,
+            "voice": voice or "tara",
+        }
+        for key in ("temperature", "top_p"):
+            if key in opts and opts[key] is not None:
+                try:
+                    kw[key] = float(opts[key])
+                except Exception:
+                    pass
+        # OrpheusModel.generate_speech is a generator yielding PCM bytes
+        # at 24 kHz int16. Pass through unchanged.
+        for chunk in self._model.generate_speech(**kw):
+            if isinstance(chunk, (bytes, bytearray)):
+                yield bytes(chunk)
+            else:
+                yield self._to_int16_bytes(np.asarray(chunk, dtype=np.float32))
+
+    def voices(self) -> list[VoiceEntry]:
+        return [VoiceEntry(*row) for row in [
+            ("tara","English","F","Tara"),
+            ("leah","English","F","Leah"),
+            ("jess","English","F","Jess"),
+            ("mia","English","F","Mia"),
+            ("leo","English","M","Leo"),
+            ("dan","English","M","Dan"),
+            ("zac","English","M","Zac"),
+            ("zoe","English","F","Zoe"),
+        ]]
+
+    def default_voice(self) -> str:
+        return "tara"
+
+
+# ── CSM (Sesame) — native transformers ───────────────────────────────
+
+
+class _CSMHandler(_BaseTTSHandler):
+    family = fd.TTS_CSM
+    sample_rate = 24000
+
+    def load(self, cfg: TTSLoadConfig) -> None:
+        # CSM landed in transformers in mid-2025 as model_type="csm".
+        import importlib
+        tf = importlib.import_module("transformers")
+        AutoProcessor = tf.AutoProcessor
+        try:
+            ModelCls = tf.CsmForConditionalGeneration
+        except AttributeError:
+            ModelCls = tf.AutoModel
+            log.warning("csm: CsmForConditionalGeneration not in "
+                        "transformers; falling back to AutoModel")
+        self._resolve_device(cfg)
+        self._processor = AutoProcessor.from_pretrained(
+            cfg.model_id, trust_remote_code=True)
+        self._model = ModelCls.from_pretrained(
+            cfg.model_id, trust_remote_code=True,
+            **self._attn_kwargs(),
+        ).to(self._torch_device)
+        self._model.eval()
+        try:
+            self.sample_rate = int(self._model.config.audio_sampling_rate)
+        except Exception:
+            pass
+
+    def synth(self, text: str, voice: str,
+              opts: dict[str, Any]) -> Iterator[bytes]:
+        import torch
+        self._seed_rng(opts)
+        inputs = self._processor(text=text, return_tensors="pt").to(
+            self._torch_device)
+        gen: dict[str, Any] = {}
+        temp = opts.get("temperature")
+        if temp is not None:
+            try:
+                t = float(temp)
+                if t > 0.0:
+                    gen["do_sample"] = True
+                    gen["temperature"] = t
+            except Exception:
+                pass
+        with torch.no_grad():
+            out = self._model.generate(**inputs, **gen)
+        # CSM returns audio tokens decoded to PCM by the processor.
+        try:
+            audio = self._processor.batch_decode_audio(out)[0]
+        except AttributeError:
+            audio = out.cpu().to(torch.float32).numpy().reshape(-1)
+        yield self._to_int16_bytes(np.asarray(audio, dtype=np.float32))
+
+    def voices(self) -> list[VoiceEntry]:
+        return [VoiceEntry("conversational", "English", "",
+                            "Conversational")]
+
+    def default_voice(self) -> str:
+        return "conversational"
+
+
+# ── Higgs-Audio v2 — zero-shot cloning ───────────────────────────────
+
+
+class _HiggsHandler(_BaseTTSHandler):
+    family = fd.TTS_HIGGS
+    sample_rate = 24000
+
+    def load(self, cfg: TTSLoadConfig) -> None:
+        from transformers import AutoModelForCausalLM, AutoProcessor
+        self._resolve_device(cfg)
+        self._processor = AutoProcessor.from_pretrained(
+            cfg.model_id, trust_remote_code=True)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            cfg.model_id, trust_remote_code=True,
+            **self._attn_kwargs(),
+        ).to(self._torch_device)
+        self._model.eval()
+
+    def synth(self, text: str, voice: str,
+              opts: dict[str, Any]) -> Iterator[bytes]:
+        import torch
+        self._seed_rng(opts)
+        ref = str(opts.get("reference_audio") or "").strip()
+        proc_kwargs: dict[str, Any] = {"text": text, "return_tensors": "pt"}
+        if ref:
+            proc_kwargs["reference_audio"] = ref
+        inputs = self._processor(**proc_kwargs).to(self._torch_device)
+        gen: dict[str, Any] = {}
+        temp = opts.get("temperature")
+        if temp is not None:
+            try:
+                t = float(temp)
+                if t > 0.0:
+                    gen["do_sample"] = True
+                    gen["temperature"] = t
+            except Exception:
+                pass
+        with torch.no_grad():
+            out = self._model.generate(**inputs, **gen)
+        try:
+            audio = self._processor.batch_decode_audio(out)[0]
+        except AttributeError:
+            audio = out.cpu().to(torch.float32).numpy().reshape(-1)
+        yield self._to_int16_bytes(np.asarray(audio, dtype=np.float32))
+
+    def voices(self) -> list[VoiceEntry]:
+        return [VoiceEntry("zero-shot", "Multi", "",
+                            "Zero-shot (use Reference)")]
+
+    def default_voice(self) -> str:
+        return "zero-shot"
+
+
+# ── VibeVoice (Microsoft) — long-form multi-speaker ──────────────────
+
+
+class _VibeVoiceTTSHandler(_BaseTTSHandler):
+    """Detection-only handler. Defers to the generic pipeline fallback
+    since VibeVoice's transformers integration is recent and exposes
+    a non-uniform API. If the future stabilises we'll add a dedicated
+    path; for now `pipeline("text-to-speech")` works."""
+    family = fd.TTS_VIBEVOICE
+    sample_rate = 24000
+
+    def load(self, cfg: TTSLoadConfig) -> None:
+        from transformers import pipeline
+        on_cuda = self._resolve_device(cfg)
+        self._model = pipeline(
+            "text-to-speech",
+            model=cfg.model_id,
+            device=0 if on_cuda else -1,
+            trust_remote_code=True,
+        )
+
+    def synth(self, text: str, voice: str,
+              opts: dict[str, Any]) -> Iterator[bytes]:
+        self._seed_rng(opts)
+        result = self._model(text)
+        if isinstance(result, dict):
+            arr = result.get("audio")
+            sr = result.get("sampling_rate")
+            if isinstance(sr, int):
+                self.sample_rate = sr
+            if arr is not None:
+                yield self._to_int16_bytes(np.asarray(arr).reshape(-1))
+
+    def voices(self) -> list[VoiceEntry]:
+        return [VoiceEntry("default", "Multi", "", "default")]
+
+    def default_voice(self) -> str:
+        return "default"
 
 
 # ── Generic pipeline fallback ────────────────────────────────────────
@@ -474,12 +836,18 @@ class _PipelineTTSHandler(_BaseTTSHandler):
 
 # Family → handler class
 _HANDLERS: dict[str, type[_BaseTTSHandler]] = {
-    fd.TTS_KOKORO:   _KokoroHandler,
-    fd.TTS_VITS:     _VitsHandler,
-    fd.TTS_SPEECHT5: _SpeechT5Handler,
-    fd.TTS_BARK:     _BarkHandler,
-    fd.TTS_PARLER:   _ParlerHandler,
-    fd.TTS_GENERIC:  _PipelineTTSHandler,
+    fd.TTS_KOKORO:    _KokoroHandler,
+    fd.TTS_VITS:      _VitsHandler,
+    fd.TTS_SPEECHT5:  _SpeechT5Handler,
+    fd.TTS_BARK:      _BarkHandler,
+    fd.TTS_PARLER:    _ParlerHandler,
+    fd.TTS_XTTS:      _XTTSHandler,
+    fd.TTS_ORPHEUS:   _OrpheusHandler,
+    fd.TTS_CSM:       _CSMHandler,
+    fd.TTS_HIGGS:     _HiggsHandler,
+    fd.TTS_VIBEVOICE: _VibeVoiceTTSHandler,
+    fd.TTS_QWEN_TTS:  _PipelineTTSHandler,
+    fd.TTS_GENERIC:   _PipelineTTSHandler,
 }
 
 

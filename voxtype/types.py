@@ -38,18 +38,6 @@ class HotkeyCombo:
     label: str = "Ctrl + Win"
 
 
-# Old top-level keys → new opts-bag keys. Read on settings load to
-# migrate existing settings.json files without dropping user prefs.
-_STT_OPTS_MIGRATIONS: dict[str, str] = {
-    "stt_task":            "task",
-    "stt_num_beams":       "num_beams",
-    "stt_initial_prompt":  "initial_prompt",
-}
-_TTS_OPTS_MIGRATIONS: dict[str, str] = {
-    "tts_length_scale":    "speed",
-}
-
-
 @dataclass
 class AppSettings:
     # ── Recording behavior ───────────────────────────────────────────
@@ -69,47 +57,55 @@ class AppSettings:
     server_enabled: bool = True
     server_port: int = 6600
 
-    # ── STT (in-process via transformers + torch) ───────────────────
-    # `stt_model_path` accepts a HF repo ID (auto-downloaded) or a local
-    # path. Paste anything — Whisper, Wav2Vec2, HuBERT, MMS, Seamless,
-    # Moonshine, SpeechT5 — the generic backend sniffs the model's
-    # config.json and picks the right loader.
+    # ── STT (one generic backend, family auto-detected) ─────────────
+    # `stt_model_path` accepts any HF repo ID (auto-downloaded) or a
+    # local path — Whisper, Wav2Vec2, HuBERT, MMS, Seamless,
+    # Moonshine, SpeechT5, Voxtral, Granite-Speech, … The generic
+    # backend sniffs the model's config.json and picks the right
+    # loader.
     stt_enabled: bool = True
     stt_auto_start: bool = True
     stt_idle_unload_sec: int = 300
-    stt_backend: str = "generic"             # always "generic" in normal use
     stt_model_path: str = "openai/whisper-base"
     stt_device: TorchDevice = "cpu"
-    stt_language: str = "en"                  # universal — every multilingual
-                                              # family honours it
+    stt_language: str = "en"
     stt_dtype: TorchDtype = "auto"
     stt_warmup: bool = True
     stt_torch_compile: bool = False
+    # Attention backend. `auto` lets transformers pick (sdpa on modern
+    # versions); `flash_attention_2` requires fp16/bf16 + Ampere+; `eager`
+    # is the safe fallback for exotic models.
+    stt_attn_impl: str = "auto"
+    # Long-form chunking for the embedded HTTP server. 0 = off (single-
+    # utterance dictation never needs this).
+    stt_chunk_length_s: int = 0
+    stt_stride_length_s: int = 0
     # Family-specific per-call options. Populated by the UI from the
-    # active backend's runtime_options() spec list. Keys depend on the
-    # detected family — Whisper writes `task`, `num_beams`,
-    # `initial_prompt`; Bark writes `temperature`; Parler writes
-    # `style`; etc.
+    # backend's runtime_options() spec list. Whisper writes `task`,
+    # `num_beams`, `temperature`, `repetition_penalty`, `initial_prompt`;
+    # Bark writes `semantic_temperature` / `coarse_temperature` / `min_eos_p`;
+    # Parler writes `style`, `temperature`, `max_new_tokens`;
+    # Voxtral / Granite / Phi-4 / Qwen-Audio write `prompt`;
+    # SpeechT5 writes `speaker_embedding`; XTTS writes the full
+    # temperature/top_p/top_k/repetition_penalty/length_penalty block.
     stt_opts: dict[str, Any] = field(default_factory=dict)
 
-    # ── TTS (in-process via torch + assorted model libs) ────────────
-    # `tts_model_path` accepts any HF repo (Kokoro, MMS-TTS, SpeechT5,
-    # Bark, Parler) or a local path. Voice list is rebuilt per-backend.
+    # ── TTS (one generic backend, family auto-detected) ─────────────
     tts_enabled: bool = False
     tts_auto_start: bool = False
     tts_idle_unload_sec: int = 600
-    tts_backend: str = "generic"
     tts_model_path: str = "hexgrad/Kokoro-82M"
     tts_device: TorchDevice = "cpu"
-    tts_voice: str = "af_heart"               # universal — every backend
-                                              # picks a voice some way
-    tts_speed: float = 1.0                    # universal-gated (suppressed
-                                              # for backends without speed)
+    tts_voice: str = "af_heart"
+    tts_speed: float = 1.0
     tts_warmup: bool = True
     tts_torch_compile: bool = False
     tts_stream: bool = False
-    # Family-specific per-call options (style prompt for Parler,
-    # speaker_embedding for SpeechT5, temperature for Bark, etc.).
+    # Mirror of stt_attn_impl for TTS handlers.
+    tts_attn_impl: str = "auto"
+    # Universal RNG seed. -1 = random. Honoured by VITS / Bark / Parler /
+    # Orpheus / Higgs / etc. — anything sampling-based.
+    tts_seed: int = -1
     tts_opts: dict[str, Any] = field(default_factory=dict)
 
     # ── LLM enhancement (via telecode proxy) ─────────────────────────
@@ -136,37 +132,11 @@ class AppSettings:
                 label=hk.get("label", "Ctrl + Win"),
             ),
         )
-        # Apply known fields first.
         for key, value in d.items():
             if key == "hotkey":
                 continue
             if hasattr(settings, key):
                 setattr(settings, key, value)
-
-        # ── Migrations from the pre-opts-bag schema ──────────────────
-        # Family-specific STT fields → stt_opts.
-        for old_key, new_key in _STT_OPTS_MIGRATIONS.items():
-            if old_key in d and new_key not in settings.stt_opts:
-                settings.stt_opts[new_key] = d[old_key]
-        # Family-specific TTS fields → tts_opts.
-        for old_key, new_key in _TTS_OPTS_MIGRATIONS.items():
-            if old_key in d and new_key not in settings.tts_opts:
-                settings.tts_opts[new_key] = d[old_key]
-        # Voice key rename: tts_speaker → tts_voice.
-        if "tts_speaker" in d and not d.get("tts_voice"):
-            settings.tts_voice = str(d["tts_speaker"] or "af_heart")
-        # tts_length_scale → tts_speed (top-level).
-        if "tts_length_scale" in d and "tts_speed" not in d:
-            try:
-                settings.tts_speed = float(d["tts_length_scale"] or 1.0)
-            except (TypeError, ValueError):
-                pass
-        # Old backend names (`whisper`, `kokoro`) → `generic`. The new
-        # backend covers them via family detection.
-        if settings.stt_backend not in {"generic"}:
-            settings.stt_backend = "generic"
-        if settings.tts_backend not in {"generic"}:
-            settings.tts_backend = "generic"
         return settings
 
 

@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +39,11 @@ STT_SEAMLESS    = "seamless"       # SeamlessM4T(v2) speech-to-text
 STT_MOONSHINE   = "moonshine"      # Moonshine encoder-decoder
 STT_S2T         = "speech_to_text" # Speech2Text legacy seq2seq
 STT_SPEECHT5    = "speecht5_asr"   # SpeechT5 ASR head
-STT_PARAKEET    = "parakeet"       # NeMo TDT/RNNT (HF mirror via parakeet-mlx etc.)
 STT_QWEN_AUDIO  = "qwen_audio"     # Qwen2-Audio / Qwen3-ASR multimodal
+STT_VOXTRAL     = "voxtral"        # Mistral Voxtral — VoxtralForConditionalGeneration
+STT_GRANITE     = "granite_speech" # IBM Granite-Speech
+STT_PHI4MM      = "phi4_multimodal"# Microsoft Phi-4-Multimodal
+STT_VIBEVOICE   = "vibevoice_asr"  # Microsoft VibeVoice ASR
 STT_GENERIC     = "generic_asr"    # transformers.pipeline fallback
 
 # TTS families
@@ -49,6 +54,10 @@ TTS_BARK        = "bark"           # Bark
 TTS_PARLER      = "parler"         # Parler-TTS (free-text style)
 TTS_XTTS        = "xtts"           # Coqui XTTS (voice cloning)
 TTS_QWEN_TTS    = "qwen_tts"       # Qwen3-TTS audio decoder
+TTS_ORPHEUS     = "orpheus"        # Canopy Orpheus — Llama backbone + SNAC vocoder
+TTS_CSM         = "csm"            # Sesame CSM — native transformers model_type=csm
+TTS_HIGGS       = "higgs"          # Boson Higgs-Audio v2
+TTS_VIBEVOICE   = "vibevoice_tts"  # Microsoft VibeVoice
 TTS_GENERIC     = "generic_tts"    # transformers.pipeline fallback
 
 
@@ -72,34 +81,105 @@ def _read_local_config(model_id: str) -> dict[str, Any]:
     return {}
 
 
+def _hf_get_json(url: str) -> tuple[int, dict[str, Any] | None, str]:
+    """GET a JSON URL with 3s timeout. Returns (status, body or None,
+    error). Uses HTTPError.code on 4xx/5xx so callers can distinguish
+    not-found / gated / network failure."""
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json", "User-Agent": "voxtype/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            if r.status == 200:
+                return 200, json.loads(r.read().decode("utf-8")), ""
+            return r.status, None, f"http {r.status}"
+    except urllib.error.HTTPError as e:
+        return e.code, None, f"http {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return 0, None, str(e) or e.__class__.__name__
+
+
 def _fetch_hf_config(repo_id: str) -> dict[str, Any]:
-    """Pull the HF model card metadata + config.json. Network call;
-    keep it tight (3 s timeout) and swallow errors."""
+    """Pull the HF model card metadata + config.json. Swallows
+    errors — returns an empty dict on failure."""
     out: dict[str, Any] = {}
     repo = repo_id.strip("/")
-    # 1) Card metadata — has pipeline_tag + tags + library_name.
-    try:
-        url = f"https://huggingface.co/api/models/{repo}"
-        req = urllib.request.Request(url, headers={
-            "Accept": "application/json", "User-Agent": "voxtype/1.0",
-        })
-        with urllib.request.urlopen(req, timeout=3) as r:
-            if r.status == 200:
-                out["card"] = json.loads(r.read().decode("utf-8"))
-    except Exception:
-        pass
-    # 2) Raw config.json — has model_type + architectures.
-    try:
-        url = f"https://huggingface.co/{repo}/resolve/main/config.json"
-        req = urllib.request.Request(url, headers={
-            "Accept": "application/json", "User-Agent": "voxtype/1.0",
-        })
-        with urllib.request.urlopen(req, timeout=3) as r:
-            if r.status == 200:
-                out["config"] = json.loads(r.read().decode("utf-8"))
-    except Exception:
-        pass
+    status, body, _ = _hf_get_json(f"https://huggingface.co/api/models/{repo}")
+    if status == 200 and isinstance(body, dict):
+        out["card"] = body
+    status, body, _ = _hf_get_json(
+        f"https://huggingface.co/{repo}/resolve/main/config.json")
+    if status == 200 and isinstance(body, dict):
+        out["config"] = body
     return out
+
+
+@dataclass
+class ModelCheck:
+    """Result of verifying a model id / local path."""
+    valid: bool          # exists and is loadable as a model
+    source: str          # "local" | "hf" | "none"
+    gated: bool = False  # HF repo requires sign-in
+    error: str = ""      # short reason when valid is False
+    family: str = ""     # detected family ("" = unknown architecture)
+
+
+def verify_model_id(model_id: str, *, stt: bool) -> ModelCheck:
+    """Confirm the entered model id / path is real and detect its
+    family in one shot. Used by the UI's Detect button.
+
+    Order:
+      1. Local path? — must exist AND have a `config.json` (or a
+         `voices/` dir for Kokoro). Return local + family.
+      2. HF repo? — hit `/api/models/<id>`. 200 = valid, 404 = not
+         found, 401/403 = gated, else network error. If valid, also
+         pull config.json so family detection can use it.
+    """
+    mid = (model_id or "").strip()
+    if not mid:
+        return ModelCheck(False, "none", error="empty")
+
+    # ── Local path ──────────────────────────────────────────────────
+    p = Path(mid).expanduser()
+    if p.exists():
+        cfg = _read_local_config(mid)
+        if not cfg:
+            return ModelCheck(False, "local",
+                               error="no config.json in directory")
+        fam = _family_from_config(cfg, mid, stt=stt)
+        return ModelCheck(True, "local", family=fam)
+
+    # ── Looks like a path that doesn't exist? ──────────────────────
+    # Reject anything with backslash, drive-letter, or absolute "/" —
+    # those are clearly meant as local paths, not HF repo ids.
+    if ("\\" in mid or mid.startswith("/")
+            or (len(mid) >= 2 and mid[1] == ":")):
+        return ModelCheck(False, "local", error="path not found")
+
+    # ── HuggingFace repo ────────────────────────────────────────────
+    repo = mid.strip("/")
+    # HF repo ids are "<org>/<name>" with no whitespace.
+    if "/" not in repo or " " in repo:
+        return ModelCheck(False, "none", error="not a valid HF repo id")
+
+    status, card, err = _hf_get_json(f"https://huggingface.co/api/models/{repo}")
+    if status == 404:
+        return ModelCheck(False, "hf", error="repo not found on HuggingFace")
+    if status in (401, 403):
+        return ModelCheck(False, "hf", gated=True,
+                           error="gated — sign-in required (huggingface-cli login)")
+    if status != 200 or not isinstance(card, dict):
+        return ModelCheck(False, "hf",
+                           error=f"unreachable ({err or 'network error'})")
+
+    # Repo exists — fetch config.json best-effort for family detect.
+    bundle: dict[str, Any] = {"card": card}
+    cfg_status, cfg_body, _ = _hf_get_json(
+        f"https://huggingface.co/{repo}/resolve/main/config.json")
+    if cfg_status == 200 and isinstance(cfg_body, dict):
+        bundle["config"] = cfg_body
+    fam = _family_from_config(bundle, mid, stt=stt)
+    return ModelCheck(True, "hf", family=fam)
 
 
 def _family_from_config(cfg: dict[str, Any], repo_id: str, *, stt: bool) -> str:
@@ -148,8 +228,14 @@ def _family_from_config(cfg: dict[str, Any], repo_id: str, *, stt: bool) -> str:
             if "mms" in rid or "mms" in tags:
                 return STT_MMS
             return STT_WAV2VEC2
-        if "parakeet" in rid or "parakeet" in archs_blob:
-            return STT_PARAKEET
+        if model_type == "voxtral" or "voxtral" in archs_blob:
+            return STT_VOXTRAL
+        if model_type == "granite_speech" or "granitespeech" in archs_blob:
+            return STT_GRANITE
+        if model_type in {"phi4_multimodal", "phi4mm"} or "phi4multimodal" in archs_blob:
+            return STT_PHI4MM
+        if "vibevoice" in model_type or "vibevoice" in archs_blob:
+            return STT_VIBEVOICE
         if model_type in {"qwen2_audio", "qwen_audio"} or "qwen2audio" in archs_blob:
             return STT_QWEN_AUDIO
         # Whisper-ish fallback: any HF model tagged
@@ -178,6 +264,14 @@ def _family_from_config(cfg: dict[str, Any], repo_id: str, *, stt: bool) -> str:
         return TTS_PARLER
     if "xtts" in rid or "coqui" in tags:
         return TTS_XTTS
+    if "orpheus" in rid or "orpheus" in archs_blob or "orpheus" in tags:
+        return TTS_ORPHEUS
+    if model_type == "csm" or "csm" in archs_blob or ("csm" in rid and "sesame" in rid):
+        return TTS_CSM
+    if "higgs" in rid or "higgs" in archs_blob:
+        return TTS_HIGGS
+    if "vibevoice" in model_type or "vibevoice" in archs_blob or "vibevoice" in rid:
+        return TTS_VIBEVOICE
     if "qwen" in rid and ("tts" in rid or pipeline_tag == "text-to-speech"):
         return TTS_QWEN_TTS
     if pipeline_tag == "text-to-speech":
@@ -198,10 +292,16 @@ def _stt_from_repo_id(model_id: str) -> str:
         return STT_MOONSHINE
     if "seamless" in rid:
         return STT_SEAMLESS
+    if "voxtral" in rid:
+        return STT_VOXTRAL
+    if "granite" in rid and "speech" in rid:
+        return STT_GRANITE
+    if "phi-4-multimodal" in rid or "phi4-multimodal" in rid or "phi-4-mm" in rid:
+        return STT_PHI4MM
+    if "vibevoice" in rid:
+        return STT_VIBEVOICE
     if "wav2vec2" in rid or "hubert" in rid or "wavlm" in rid:
         return STT_WAV2VEC2
-    if "parakeet" in rid:
-        return STT_PARAKEET
     if "speecht5" in rid and "asr" in rid:
         return STT_SPEECHT5
     if "speech_to_text" in rid or "s2t" in rid:
@@ -225,6 +325,14 @@ def _tts_from_repo_id(model_id: str) -> str:
         return TTS_PARLER
     if "xtts" in rid or "coqui" in rid:
         return TTS_XTTS
+    if "orpheus" in rid:
+        return TTS_ORPHEUS
+    if "sesame" in rid and "csm" in rid:
+        return TTS_CSM
+    if "higgs" in rid and "audio" in rid:
+        return TTS_HIGGS
+    if "vibevoice" in rid:
+        return TTS_VIBEVOICE
     if "qwen" in rid and "tts" in rid:
         return TTS_QWEN_TTS
     return ""
@@ -319,6 +427,15 @@ def stt_runtime_options(family: str) -> list[STTOptionSpec]:
                 help="Beam-search width. 1 = greedy decoding, fastest. "
                      "Higher = lower WER but ~N× slower.",
                 min=1, max=10),
+            STTOptionSpec("temperature", "float", "Temperature", 0.0,
+                help="0.0 = deterministic (recommended). Raise to 0.2-0.4 "
+                     "as a fallback for noisy mics where greedy decoding "
+                     "stalls.",
+                min=0.0, max=1.0, step=0.05),
+            STTOptionSpec("repetition_penalty", "float", "Rep. Penalty", 1.0,
+                help="1.0 = off. Bump to 1.1-1.3 if Whisper loops on "
+                     "filler sounds (um, hum, breath).",
+                min=1.0, max=2.0, step=0.05),
             STTOptionSpec("initial_prompt", "str", "Initial Prompt", "",
                 help="Free text fed to the decoder to bias decoding. "
                      "Useful for jargon, acronyms, proper names. "
@@ -333,6 +450,10 @@ def stt_runtime_options(family: str) -> list[STTOptionSpec]:
             STTOptionSpec("num_beams", "int", "Beams", 5,
                 help="Seamless defaults to beam=5 (recommended).",
                 min=1, max=10),
+            STTOptionSpec("tgt_lang", "str", "Target Lang (ISO-639-3)", "",
+                help="Override the output language code. Empty = derive "
+                     "from universal Language + Task. Use ISO-639-3 "
+                     "(eng, fra, spa, cmn, …)."),
         ]
     if family == STT_MOONSHINE:
         return [
@@ -340,8 +461,53 @@ def stt_runtime_options(family: str) -> list[STTOptionSpec]:
                 help="Moonshine is English-only; beams >1 buys little.",
                 min=1, max=5),
         ]
+    if family == STT_VOXTRAL:
+        return [
+            STTOptionSpec("task", "enum", "Task", "transcribe",
+                help="transcribe = source language. translate → EN.",
+                choices=_TASK_CHOICES),
+            STTOptionSpec("temperature", "float", "Temperature", 0.0,
+                help="Sampling temperature. 0.0 = greedy decoding.",
+                min=0.0, max=1.0, step=0.05),
+            STTOptionSpec("prompt", "text", "Instruction", "",
+                help="Optional system instruction. Voxtral is an "
+                     "instruction-tuned audio LLM — leave empty for "
+                     "plain transcription, or write e.g. 'Summarise:' / "
+                     "'Translate to French:' for instruction-conditioned "
+                     "transcription."),
+        ]
+    if family == STT_GRANITE:
+        return [
+            STTOptionSpec("task", "enum", "Task", "transcribe",
+                help="ASR or speech translation (AST → English).",
+                choices=_TASK_CHOICES),
+            STTOptionSpec("prompt", "text", "Instruction", "",
+                help="Optional instruction prompt for Granite-Speech."),
+        ]
+    if family == STT_PHI4MM:
+        return [
+            STTOptionSpec("prompt", "text", "Instruction",
+                "Transcribe the audio.",
+                help="Phi-4 is an instruction LLM — the prompt drives "
+                     "behaviour. 'Transcribe the audio.' is the default "
+                     "ASR prompt."),
+            STTOptionSpec("temperature", "float", "Temperature", 0.0,
+                help="0.0 = greedy.", min=0.0, max=1.0, step=0.05),
+        ]
+    if family == STT_QWEN_AUDIO:
+        return [
+            STTOptionSpec("prompt", "text", "Instruction",
+                "Transcribe the audio.",
+                help="Qwen2-Audio is instruction-tuned. Override to "
+                     "translate, punctuate, summarise, etc."),
+            STTOptionSpec("temperature", "float", "Temperature", 0.0,
+                help="0.0 = greedy.", min=0.0, max=1.0, step=0.05),
+            STTOptionSpec("top_p", "float", "Top-p", 0.9,
+                help="Nucleus sampling. Only used when temperature > 0.",
+                min=0.0, max=1.0, step=0.05),
+        ]
     if family in {STT_WAV2VEC2, STT_MMS, STT_S2T, STT_SPEECHT5,
-                   STT_PARAKEET, STT_QWEN_AUDIO, STT_GENERIC}:
+                   STT_VIBEVOICE, STT_GENERIC}:
         # CTC and pipeline-fallback families have no extra knobs —
         # language (universal) is enough.
         return []
@@ -351,10 +517,10 @@ def stt_runtime_options(family: str) -> list[STTOptionSpec]:
 def stt_capabilities(family: str) -> set[str]:
     """Capability flags advertised by a given family — drives the
     UI's universal-row visibility (e.g. dtype dropdown, language combo)."""
-    base = {"dtype", "torch_compile"}
+    base = {"dtype", "torch_compile", "attn_impl"}
     if family == STT_WHISPER:
         return base | {"multilingual", "task_translate", "initial_prompt",
-                        "num_beams", "bf16"}
+                        "num_beams", "bf16", "chunk_length"}
     if family == STT_SEAMLESS:
         return base | {"multilingual", "task_translate", "num_beams", "bf16"}
     if family == STT_MMS:
@@ -367,12 +533,18 @@ def stt_capabilities(family: str) -> set[str]:
         return base
     if family == STT_WAV2VEC2:
         return base   # English-only or per-language repos
-    if family == STT_PARAKEET:
-        return base | {"num_beams"}
     if family == STT_QWEN_AUDIO:
+        return base | {"multilingual", "bf16", "prompt"}
+    if family == STT_VOXTRAL:
+        return base | {"multilingual", "task_translate", "bf16", "prompt"}
+    if family == STT_GRANITE:
+        return base | {"multilingual", "task_translate", "bf16", "prompt"}
+    if family == STT_PHI4MM:
+        return base | {"multilingual", "bf16", "prompt"}
+    if family == STT_VIBEVOICE:
         return base | {"multilingual", "bf16"}
     if family == STT_GENERIC:
-        return base
+        return base | {"chunk_length"}
     return set()
 
 
@@ -385,6 +557,13 @@ def tts_runtime_options(family: str) -> list[TTSOptionSpec]:
                      "Parler-TTS conditions on this prompt — e.g. "
                      "'A male speaker with a slightly low-pitched voice, "
                      "speaking quickly in a small room.'"),
+            TTSOptionSpec("temperature", "float", "Temperature", 1.0,
+                help="Sampling temperature. Lower = more conservative.",
+                min=0.1, max=1.5, step=0.05),
+            TTSOptionSpec("max_new_tokens", "int", "Max Tokens", 2580,
+                help="Cap on generated audio tokens. Raise if Parler "
+                     "truncates mid-sentence on long inputs.",
+                min=200, max=8192),
         ]
     if family == TTS_SPEECHT5:
         return [
@@ -407,36 +586,133 @@ def tts_runtime_options(family: str) -> list[TTSOptionSpec]:
                           ("nl","Dutch"),("cs","Czech"),("ar","Arabic"),
                           ("zh-cn","Mandarin Chinese"),("hu","Hungarian"),
                           ("ko","Korean"),("ja","Japanese"),("hi","Hindi")]),
+            TTSOptionSpec("temperature", "float", "Temperature", 0.75,
+                help="Sampling temperature for the GPT decoder.",
+                min=0.1, max=1.5, step=0.05),
+            TTSOptionSpec("top_p", "float", "Top-p", 0.85,
+                help="Nucleus sampling cutoff.",
+                min=0.0, max=1.0, step=0.05),
+            TTSOptionSpec("top_k", "int", "Top-k", 50,
+                help="Top-k sampling cutoff.", min=0, max=200),
+            TTSOptionSpec("repetition_penalty", "float", "Rep. Penalty", 10.0,
+                help="XTTS-specific: raise to break out of audio loops "
+                     "/ stutters. Default 10.0 (high vs. other LMs).",
+                min=1.0, max=20.0, step=0.5),
+            TTSOptionSpec("length_penalty", "float", "Length Penalty", 1.0,
+                help="Encourage longer (>1) or shorter (<1) outputs.",
+                min=0.1, max=3.0, step=0.1),
         ]
     if family == TTS_BARK:
         return [
+            TTSOptionSpec("semantic_temperature", "float",
+                "Semantic Temp.", 0.7,
+                help="Temperature for the semantic (text→tokens) stage. "
+                     "Lower = more deterministic phrasing.",
+                min=0.1, max=1.5, step=0.05),
+            TTSOptionSpec("coarse_temperature", "float",
+                "Coarse Temp.", 0.7,
+                help="Temperature for the coarse acoustic stage. "
+                     "Affects prosody / cadence.",
+                min=0.1, max=1.5, step=0.05),
+            TTSOptionSpec("min_eos_p", "float", "Min EOS Prob.", 0.2,
+                help="End-of-speech probability threshold. Lower if Bark "
+                     "cuts off early; raise if it appends silence/babble.",
+                min=0.01, max=0.95, step=0.01),
+        ]
+    if family == TTS_KOKORO:
+        return [
+            TTSOptionSpec("voice_blend", "str", "Voice Blend", "",
+                help="Optional voice mix. Format: 'af_sarah:0.6,af_bella:0.4'. "
+                     "Overrides the picked voice when set."),
+        ]
+    if family == TTS_VITS:
+        return [
+            TTSOptionSpec("noise_scale", "float", "Noise Scale", 0.667,
+                help="Sampling variance — higher = more expressive but "
+                     "less stable. VITS default 0.667.",
+                min=0.0, max=1.5, step=0.05),
+            TTSOptionSpec("noise_scale_duration", "float",
+                "Duration Variance", 0.8,
+                help="Variance of the duration predictor — controls "
+                     "rhythm jitter. VITS default 0.8.",
+                min=0.0, max=1.5, step=0.05),
+            TTSOptionSpec("seed", "int", "Seed", -1,
+                help="-1 = random. Set a fixed value for reproducible "
+                     "renders.",
+                min=-1, max=2_147_483_647),
+        ]
+    if family == TTS_QWEN_TTS:
+        return [
             TTSOptionSpec("temperature", "float", "Temperature", 0.7,
-                help="Sampling temperature for Bark's generation. "
-                     "Lower = more deterministic.",
+                help="Sampling temperature.",
+                min=0.1, max=1.5, step=0.05),
+            TTSOptionSpec("top_p", "float", "Top-p", 0.9,
+                help="Nucleus sampling cutoff.",
+                min=0.0, max=1.0, step=0.05),
+        ]
+    if family == TTS_ORPHEUS:
+        return [
+            TTSOptionSpec("temperature", "float", "Temperature", 0.7,
+                help="Sampling temperature for the LM-driven decoder.",
+                min=0.1, max=1.5, step=0.05),
+            TTSOptionSpec("top_p", "float", "Top-p", 0.9,
+                help="Nucleus sampling cutoff.",
+                min=0.0, max=1.0, step=0.05),
+            TTSOptionSpec("emotion_tags", "str", "Emotion Tags", "",
+                help="Optional tags injected into the text — e.g. "
+                     "'<laugh>', '<sigh>'. Comma-separated."),
+        ]
+    if family == TTS_CSM:
+        return [
+            TTSOptionSpec("temperature", "float", "Temperature", 0.9,
+                help="Sampling temperature.",
                 min=0.1, max=1.5, step=0.05),
         ]
-    # Kokoro / VITS / generic: no extra knobs.
+    if family == TTS_HIGGS:
+        return [
+            TTSOptionSpec("temperature", "float", "Temperature", 0.7,
+                help="Sampling temperature.",
+                min=0.1, max=1.5, step=0.05),
+            TTSOptionSpec("reference_audio", "str", "Reference WAV", "",
+                help="Optional reference clip for zero-shot voice "
+                     "cloning. Higgs-Audio v2 supports this natively."),
+        ]
+    if family == TTS_VIBEVOICE:
+        return [
+            TTSOptionSpec("temperature", "float", "Temperature", 0.7,
+                help="Sampling temperature.",
+                min=0.1, max=1.5, step=0.05),
+        ]
+    # generic: no extra knobs.
     return []
 
 
 def tts_capabilities(family: str) -> set[str]:
-    base = {"speed", "torch_compile"}
+    base = {"speed", "torch_compile", "attn_impl"}
     if family == TTS_KOKORO:
         return base | {"stream", "multilingual"}
     if family == TTS_VITS:
-        return base   # per-language repo (multilingual via repo id)
+        return base | {"seed"}  # per-language repo (multilingual via repo id)
     if family == TTS_SPEECHT5:
         return base
     if family == TTS_BARK:
-        return {"torch_compile"}   # Bark doesn't honour speed
+        return {"torch_compile", "attn_impl"}   # Bark doesn't honour speed
     if family == TTS_PARLER:
         return base | {"style_prompt", "multilingual"}
     if family == TTS_XTTS:
         return base | {"voice_clone", "multilingual"}
     if family == TTS_QWEN_TTS:
         return base | {"multilingual"}
+    if family == TTS_ORPHEUS:
+        return base | {"emotion_tags"}
+    if family == TTS_CSM:
+        return base | {"multilingual"}
+    if family == TTS_HIGGS:
+        return base | {"voice_clone", "multilingual"}
+    if family == TTS_VIBEVOICE:
+        return base | {"multilingual"}
     if family == TTS_GENERIC:
-        return {"torch_compile"}
+        return {"torch_compile", "attn_impl"}
     return set()
 
 
@@ -450,8 +726,11 @@ def stt_family_label(family: str) -> str:
         STT_MOONSHINE:  "Moonshine · English",
         STT_S2T:        "Speech2Text · seq2seq",
         STT_SPEECHT5:   "SpeechT5 ASR",
-        STT_PARAKEET:   "Parakeet TDT/RNNT",
         STT_QWEN_AUDIO: "Qwen2-Audio · multimodal",
+        STT_VOXTRAL:    "Voxtral · multilingual · instruction-tuned",
+        STT_GRANITE:    "Granite-Speech · multilingual · AST",
+        STT_PHI4MM:     "Phi-4-Multimodal · instruction LLM",
+        STT_VIBEVOICE:  "VibeVoice ASR · long-form",
         STT_GENERIC:    "Generic ASR (pipeline)",
     }.get(family, "")
 
@@ -545,6 +824,28 @@ _SPEECHT5_DEFAULTS_RAW: list[tuple[str, str, str, str]] = [
     ("Matthijs/cmu-arctic-xvectors:3457","English","F","CLB-Female-3457"),
 ]
 
+_ORPHEUS_VOICES_RAW: list[tuple[str, str, str, str]] = [
+    # Orpheus ships with named voices (tara, leah, jess, leo, dan, mia, …).
+    ("tara",    "English", "F", "Tara"),
+    ("leah",    "English", "F", "Leah"),
+    ("jess",    "English", "F", "Jess"),
+    ("mia",     "English", "F", "Mia"),
+    ("leo",     "English", "M", "Leo"),
+    ("dan",     "English", "M", "Dan"),
+    ("zac",     "English", "M", "Zac"),
+    ("zoe",     "English", "F", "Zoe"),
+]
+
+_CSM_VOICES_RAW: list[tuple[str, str, str, str]] = [
+    # CSM ships a single base voice; users pass a reference clip for cloning.
+    ("conversational", "English", "", "Conversational"),
+]
+
+_HIGGS_VOICES_RAW: list[tuple[str, str, str, str]] = [
+    # Higgs-Audio v2 is zero-shot — voice is implied by reference audio.
+    ("zero-shot", "Multi", "", "Zero-shot (use Reference)"),
+]
+
 
 def tts_voices_for_family(family: str) -> list[VoiceEntry]:
     """Static voice catalog for a family, available pre-load so the
@@ -561,6 +862,12 @@ def tts_voices_for_family(family: str) -> list[VoiceEntry]:
         return [VoiceEntry(*row) for row in _PARLER_PRESETS_RAW]
     if family == TTS_SPEECHT5:
         return [VoiceEntry(*row) for row in _SPEECHT5_DEFAULTS_RAW]
+    if family == TTS_ORPHEUS:
+        return [VoiceEntry(*row) for row in _ORPHEUS_VOICES_RAW]
+    if family == TTS_CSM:
+        return [VoiceEntry(*row) for row in _CSM_VOICES_RAW]
+    if family == TTS_HIGGS:
+        return [VoiceEntry(*row) for row in _HIGGS_VOICES_RAW]
     return []
 
 
@@ -578,5 +885,9 @@ def tts_family_label(family: str) -> str:
         TTS_PARLER:    "Parler · style-prompt",
         TTS_XTTS:      "XTTS · voice cloning",
         TTS_QWEN_TTS:  "Qwen3-TTS",
+        TTS_ORPHEUS:   "Orpheus · Llama + SNAC · emotion tags",
+        TTS_CSM:       "CSM · conversational",
+        TTS_HIGGS:     "Higgs-Audio v2 · zero-shot cloning",
+        TTS_VIBEVOICE: "VibeVoice · long-form · multi-speaker",
         TTS_GENERIC:   "Generic TTS (pipeline)",
     }.get(family, "")

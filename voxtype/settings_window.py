@@ -361,23 +361,28 @@ class _DetectBridge(QObject):
     """Thread bridge for the Detect button. Worker thread `emit`s into
     `done`; Qt delivers the slot call on the GUI thread because the
     bridge instance is created there. `QTimer.singleShot` from a
-    non-Qt thread is unreliable — Signal/Slot is the canonical fix."""
-    done = Signal(str, str)   # (family, family_label)
+    non-Qt thread is unreliable — Signal/Slot is the canonical fix.
+
+    Payload: (valid, source, gated, family, family_label, error)
+    """
+    done = Signal(bool, str, bool, str, str, str)
 
 
 def _detect_button(line_edit: QLineEdit, status_lbl: QLabel,
                     default_model: str, *, modality: str,
                     on_detected: Callable[[str], None] | None = None) -> QPushButton:
-    """`Detect` button that resolves the model id to a family via the
-    backend's family_detect module. `modality` ∈ {'stt', 'tts'}.
+    """`Detect` button that VERIFIES the entered model id / path AND
+    detects its family. `modality` ∈ {'stt', 'tts'}.
 
     On click:
       1. Read the model id (or fall back to `default_model`).
-      2. Hand off to family_detect.detect_*_family (local config.json
-         first, then HF metadata) in a worker thread.
+      2. Hand off to family_detect.verify_model_id in a worker —
+         checks local path existence OR pings HF's `/api/models/<id>`.
       3. Worker emits the Detected signal — the slot updates the
-         status pill on the Qt thread and fires the on_detected
-         callback so the card can rebuild its per-family widgets.
+         status pill on the Qt thread (✓ family / ✓ exists, unknown /
+         🔒 gated / ✗ not found / ⚠ offline) and fires the
+         on_detected callback so the card can rebuild its per-family
+         widgets.
     """
     from voxtype.backends import family_detect as fd
     from voxtype.qt_theme import OK, WARN
@@ -392,13 +397,35 @@ def _detect_button(line_edit: QLineEdit, status_lbl: QLabel,
         status_lbl.setStyleSheet(f"color: {color}; font-size: 11px;")
         status_lbl.setToolTip(tip)
 
-    def _on_done(fam: str, label: str) -> None:
-        if fam:
-            _set(f"✓ {label or fam}", OK, f"Detected family: {fam}")
+    def _on_done(valid: bool, source: str, gated: bool,
+                  fam: str, label: str, err: str) -> None:
+        if not valid:
+            if gated:
+                _set("🔒 gated",
+                      WARN,
+                      "HuggingFace repo requires sign-in. Run "
+                      "`huggingface-cli login` in the venv first.")
+            elif source == "local":
+                _set("✗ path not found", WARN,
+                      err or "Local path doesn't exist or has no "
+                              "config.json / voices directory.")
+            elif source == "hf":
+                _set("✗ not found", WARN,
+                      err or "Repo not found on HuggingFace.")
+            else:
+                _set("✗ invalid", WARN,
+                      err or "Not a valid model path or HF repo id "
+                              "(expected `<org>/<name>`).")
+        elif fam:
+            tag = "local" if source == "local" else "HF"
+            _set(f"✓ {label or fam}", OK,
+                  f"Verified on {tag}. Detected family: {fam}")
         else:
-            _set("⚠ unknown", WARN,
-                  "Couldn't detect family. The generic pipeline "
-                  "fallback will be used at load time.")
+            tag = "local" if source == "local" else "HuggingFace"
+            _set("✓ exists · unknown family", OK,
+                  f"Found on {tag}, but couldn't recognise the "
+                  f"architecture. The generic pipeline fallback "
+                  f"will be tried at load time.")
         if on_detected is not None:
             try:
                 on_detected(fam)
@@ -413,20 +440,22 @@ def _detect_button(line_edit: QLineEdit, status_lbl: QLabel,
         if not model_id:
             _set("(empty)", FG_MUTE)
             return
-        _set("detecting…", FG_MUTE)
+        _set("verifying…", FG_MUTE)
 
         def _worker() -> None:
             try:
-                if modality == "stt":
-                    fam = fd.detect_stt_family(model_id)
-                    label = fd.stt_family_label(fam) if fam else ""
+                check = fd.verify_model_id(model_id, stt=(modality == "stt"))
+                fam = check.family
+                if fam:
+                    label = (fd.stt_family_label(fam) if modality == "stt"
+                             else fd.tts_family_label(fam))
                 else:
-                    fam = fd.detect_tts_family(model_id)
-                    label = fd.tts_family_label(fam) if fam else ""
+                    label = ""
+                bridge.done.emit(check.valid, check.source, check.gated,
+                                  fam or "", label or "", check.error or "")
             except Exception as exc:
-                log.warning("detect failed for %r: %s", model_id, exc)
-                fam, label = "", ""
-            bridge.done.emit(fam or "", label or "")
+                log.warning("verify failed for %r: %s", model_id, exc)
+                bridge.done.emit(False, "none", False, "", "", str(exc))
 
         Thread(target=_worker, daemon=True).start()
 
@@ -803,6 +832,18 @@ def _build_stt_card(window) -> QWidget:
         ]))
     body.addWidget(dtype_row); state["dtype_row"] = dtype_row
 
+    # Attention implementation — universal across all transformers families.
+    attn_row = _row(_label("Attention",
+        "Attention backend. auto = let transformers pick (sdpa on modern "
+        "versions). flash_attention_2 needs fp16/bf16 + Ampere+ AND the "
+        "flash-attn wheel installed (see setup.ps1 -FlashAttn)."),
+        _combo("stt_attn_impl", [
+            ("auto", "Auto"), ("sdpa", "SDPA (default)"),
+            ("flash_attention_2", "Flash-Attn 2"),
+            ("eager", "Eager (compat)"),
+        ]))
+    body.addWidget(attn_row); state["attn_row"] = attn_row
+
     # ── Advanced (per-family) ────────────────────────────────────────
     body.addWidget(QLabel(""))  # spacer
     adv_header = QLabel("Advanced (per-family)")
@@ -986,6 +1027,25 @@ def _build_tts_card(window) -> QWidget:
         "Synthesis rate. 1.0 = normal, >1 = faster, <1 = slower."),
         _slider_float("tts_speed", 0.5, 2.0, 0.05, suffix="x"))
     body.addWidget(speed_row); state["speed_row"] = speed_row
+
+    # Attention implementation (universal across transformers families).
+    attn_row = _row(_label("Attention",
+        "Attention backend. auto = transformers default (sdpa). "
+        "flash_attention_2 needs fp16/bf16 + Ampere+ + the flash-attn "
+        "wheel (setup.ps1 -FlashAttn)."),
+        _combo("tts_attn_impl", [
+            ("auto", "Auto"), ("sdpa", "SDPA (default)"),
+            ("flash_attention_2", "Flash-Attn 2"),
+            ("eager", "Eager (compat)"),
+        ]))
+    body.addWidget(attn_row); state["attn_row"] = attn_row
+
+    # Seed — universal RNG for sampling-based families.
+    seed_row = _row(_label("Seed",
+        "RNG seed for sampling-based TTS (VITS, Bark, Parler, Orpheus, "
+        "Higgs). -1 = random. Set a fixed value for reproducible renders."),
+        _spin("tts_seed", -1, 2_147_483_647))
+    body.addWidget(seed_row); state["seed_row"] = seed_row
 
     # ── Advanced ────────────────────────────────────────────────────
     body.addWidget(QLabel(""))

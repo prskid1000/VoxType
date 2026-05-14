@@ -1,16 +1,14 @@
-"""STT engine orchestrator — owns lifecycle, delegates to a backend.
+"""STT engine orchestrator — owns lifecycle, delegates to the generic
+backend.
 
-The actual transcription work is done by a swappable
-`voxtype.backends.STTBackend` instance (the generic backend in
-normal use). This module handles:
+The actual transcription work is done by `GenericSTTBackend`, which
+auto-dispatches by model family. This module handles:
   - load / unload locking
   - idle-unload watcher
   - status listeners
   - rebuild-on-config-change via `_key()`
 
-Per-family options live in `settings.stt_opts` (a free-form dict) so
-backends can introduce new family-specific knobs without ever needing
-to add a top-level AppSettings field.
+Per-family options live in `settings.stt_opts` (a free-form dict).
 """
 from __future__ import annotations
 
@@ -22,16 +20,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from voxtype.backends import (
-    get_stt_backend, resolve_stt_backend, stt_backend_names,
-)
+from voxtype.backends import get_stt_backend
 from voxtype.backends.shared import WHISPER_LANGUAGES
 from voxtype.backends.stt_base import LoadConfig, STTBackend
 
 log = logging.getLogger("voxtype.stt_engine")
 
 
-# Re-export for callers that read `DEFAULT_MODEL` / language helpers.
 DEFAULT_MODEL = "openai/whisper-base"
 LANGUAGES = WHISPER_LANGUAGES
 
@@ -47,18 +42,12 @@ def language_combo_options() -> list[tuple[str, str]]:
     ]
 
 
-def available_backends() -> list[str]:
-    """Names of STT backends that imported successfully."""
-    return stt_backend_names()
-
-
 @dataclass
 class EngineStatus:
     running: bool = False
     ready: bool = False
     pid: int | None = None
     last_error: str = ""
-    backend: str = ""
     family: str = ""
 
     @property
@@ -71,7 +60,6 @@ class STTEngine:
 
     def __init__(self) -> None:
         self._backend: STTBackend | None = None
-        self._backend_name: str = ""
         self._model_lock = asyncio.Lock()
         self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxtype-stt")
         self._loaded_key: tuple | None = None
@@ -81,13 +69,13 @@ class STTEngine:
         self._idle_unload_sec = 0
         self._idle_watch_started = False
 
-        # Current settings snapshot.
         self._model_path = ""
         self._device = "cpu"
         self._language = "en"
         self._dtype_pref = "auto"
         self._warmup = True
         self._torch_compile = False
+        self._attn_impl = "auto"
         self._opts: dict[str, Any] = {}
 
     # ── Listener wiring ──────────────────────────────────────────────
@@ -107,7 +95,6 @@ class STTEngine:
             ready=self._status.ready,
             pid=None,
             last_error=self._status.last_error,
-            backend=self._backend_name,
             family=family,
         )
 
@@ -124,29 +111,25 @@ class STTEngine:
     # ── Configuration ────────────────────────────────────────────────
 
     def _effective_model(self) -> str:
-        if self._model_path:
-            return self._model_path
-        if self._backend is not None:
-            return self._backend.default_model or DEFAULT_MODEL
-        return DEFAULT_MODEL
+        return self._model_path or DEFAULT_MODEL
 
     def _key(self) -> tuple:
         # Fields that require a model rebuild. Per-call kwargs (language,
         # task, beams, prompt) are NOT in here.
         return (
-            "generic",
             self._effective_model(), self._device,
             self._dtype_pref, bool(self._torch_compile),
+            self._attn_impl,
         )
 
     async def configure(self, s) -> None:
-        self._backend_name = "generic"
         self._model_path = str(getattr(s, "stt_model_path", "") or "")
         self._device = str(getattr(s, "stt_device", "cpu"))
         self._language = str(getattr(s, "stt_language", "en") or "en")
         self._dtype_pref = str(getattr(s, "stt_dtype", "auto") or "auto")
         self._warmup = bool(getattr(s, "stt_warmup", True))
         self._torch_compile = bool(getattr(s, "stt_torch_compile", False))
+        self._attn_impl = str(getattr(s, "stt_attn_impl", "auto") or "auto")
         self._idle_unload_sec = int(getattr(s, "stt_idle_unload_sec", 0))
         opts = getattr(s, "stt_opts", {}) or {}
         self._opts = dict(opts) if isinstance(opts, dict) else {}
@@ -169,9 +152,8 @@ class STTEngine:
 
     async def _do_load_locked(self) -> None:
         model_id = self._effective_model()
-        backend = resolve_stt_backend(model_id)
-        log.info("stt loading backend=%s model=%s device=%s",
-                 backend.name, model_id, self._device)
+        backend = get_stt_backend()
+        log.info("stt loading model=%s device=%s", model_id, self._device)
         self._status.last_error = ""
         self._status.running = False
         self._status.ready = False
@@ -183,17 +165,17 @@ class STTEngine:
             dtype=self._dtype_pref,
             warmup=self._warmup,
             torch_compile=self._torch_compile,
+            attn_impl=self._attn_impl,
         )
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(self._exec, backend.load_sync, cfg)
             self._backend = backend
-            self._backend_name = backend.name
             self._loaded_key = self._key()
             self._status.running = True
             self._status.ready = True
             self._last_used = time.monotonic()
-            log.info("stt ready (backend=%s %s)", backend.name, backend.runtime_info())
+            log.info("stt ready (%s)", backend.runtime_info())
             self._notify()
             self._ensure_idle_watcher()
         except Exception as exc:  # noqa: BLE001
@@ -213,7 +195,7 @@ class STTEngine:
     async def _do_unload_locked(self) -> None:
         if self._backend is None:
             return
-        log.info("stt unloading backend=%s", self._backend_name)
+        log.info("stt unloading")
         be = self._backend
         self._backend = None
         self._loaded_key = None
@@ -230,16 +212,14 @@ class STTEngine:
     def _build_opts(self, language: str | None) -> dict[str, Any]:
         """Per-call opts dict assembled from settings + filtered against
         the backend's `supports()` flags. The universal `language` is
-        always passed through; family-specific opts (task, num_beams,
-        initial_prompt, etc.) are filtered out for backends that don't
-        honour them so a stale stt_opts entry can't confuse a different
-        family."""
+        always passed through; family-specific opts are filtered out
+        for backends that don't honour them so a stale entry from a
+        different family can't sneak through."""
         backend = self._backend
         lang = (language or self._language or "en").strip() or "en"
         out: dict[str, Any] = {"language": lang}
         if not backend:
             return out
-        # Forward only the family-relevant subset.
         specs = backend.runtime_options() if hasattr(backend, "runtime_options") else []
         allowed = {s.key for s in specs}
         for k, v in self._opts.items():

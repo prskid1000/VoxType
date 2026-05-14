@@ -47,6 +47,7 @@ class _BaseHandler:
         self._processor: Any = None
         self._torch_device: str = "cpu"
         self._torch_dtype: Any = None
+        self._attn_impl: str = "auto"
 
     @staticmethod
     def _pick_dtype(pref: str, on_cuda: bool):
@@ -67,7 +68,25 @@ class _BaseHandler:
             log.warning("%s: cuda requested but unavailable — using CPU", self.family)
         self._torch_device = "cuda" if on_cuda else "cpu"
         self._torch_dtype = self._pick_dtype(cfg.dtype, on_cuda)
+        self._attn_impl = (cfg.attn_impl or "auto").lower()
         return on_cuda
+
+    def _from_pretrained_kwargs(self) -> dict[str, Any]:
+        """Common kwargs for `from_pretrained` — dtype + attn impl.
+        flash_attention_2 requires fp16/bf16; we downgrade silently
+        on fp32 to spare users a cryptic transformers error."""
+        import torch
+        kw: dict[str, Any] = {"torch_dtype": self._torch_dtype}
+        impl = self._attn_impl
+        if impl in {"sdpa", "flash_attention_2", "eager"}:
+            if (impl == "flash_attention_2"
+                    and self._torch_dtype == torch.float32):
+                log.warning("%s: flash_attention_2 requires fp16/bf16; "
+                            "falling back to sdpa", self.family)
+                impl = "sdpa"
+            kw["attn_implementation"] = impl
+        # "auto" → let transformers pick (sdpa on recent versions).
+        return kw
 
     def load(self, cfg: LoadConfig) -> None:  # pragma: no cover — abstract
         raise NotImplementedError
@@ -96,7 +115,7 @@ class _WhisperHandler(_BaseHandler):
         self._resolve_device(cfg)
         self._processor = AutoProcessor.from_pretrained(cfg.model_id)
         self._model = WhisperForConditionalGeneration.from_pretrained(
-            cfg.model_id, torch_dtype=self._torch_dtype,
+            cfg.model_id, **self._from_pretrained_kwargs(),
         ).to(self._torch_device)
         self._model.eval()
         if cfg.torch_compile:
@@ -115,11 +134,23 @@ class _WhisperHandler(_BaseHandler):
         import torch
         inputs = self._processor(audio, sampling_rate=16000, return_tensors="pt")
         feats = inputs.input_features.to(self._torch_device, dtype=self._torch_dtype)
+        beams = max(1, int(opts.get("num_beams") or 1))
+        temp = float(opts.get("temperature") or 0.0)
+        rep = float(opts.get("repetition_penalty") or 1.0)
         gen: dict = {
             "task": str(opts.get("task") or "transcribe"),
             "max_new_tokens": 440,
-            "num_beams": max(1, int(opts.get("num_beams") or 1)),
+            "num_beams": beams,
         }
+        # Sampling kicks in only when explicitly asked. Whisper's beam
+        # search and sampling are mutually exclusive — if both num_beams>1
+        # AND temperature>0 are set, prefer beams (the user's intent is
+        # quality, not diversity).
+        if temp > 0.0 and beams == 1:
+            gen["do_sample"] = True
+            gen["temperature"] = temp
+        if rep > 1.0:
+            gen["repetition_penalty"] = rep
         lang = str(opts.get("language") or "").lower()
         if lang and lang != "auto":
             gen["language"] = lang
@@ -148,7 +179,7 @@ class _Wav2Vec2Handler(_BaseHandler):
         self._resolve_device(cfg)
         self._processor = AutoProcessor.from_pretrained(cfg.model_id)
         self._model = AutoModelForCTC.from_pretrained(
-            cfg.model_id, torch_dtype=self._torch_dtype,
+            cfg.model_id, **self._from_pretrained_kwargs(),
         ).to(self._torch_device)
         self._model.eval()
         if cfg.torch_compile:
@@ -213,7 +244,7 @@ class _MMSHandler(_Wav2Vec2Handler):
         )
         self._model = Wav2Vec2ForCTC.from_pretrained(
             self._model_id, target_lang=lang3, ignore_mismatched_sizes=True,
-            torch_dtype=self._torch_dtype,
+            **self._from_pretrained_kwargs(),
         ).to(self._torch_device)
         self._model.load_adapter(lang3)
         self._model.eval()
@@ -233,7 +264,7 @@ class _SeamlessHandler(_BaseHandler):
         self._processor = AutoProcessor.from_pretrained(cfg.model_id)
         # Note: SeamlessM4Tv2 covers both v1 and v2 — single class.
         self._model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
-            cfg.model_id, torch_dtype=self._torch_dtype,
+            cfg.model_id, **self._from_pretrained_kwargs(),
         ).to(self._torch_device)
         self._model.eval()
 
@@ -246,9 +277,13 @@ class _SeamlessHandler(_BaseHandler):
                   for k, v in inputs.items()}
         task = str(opts.get("task") or "transcribe")
         lang = str(opts.get("language") or "en").lower()
-        # Seamless uses ISO 639-3 codes
-        lang3 = _ISO2_TO_ISO3.get(lang, lang)
-        tgt = "eng" if task == "translate" else lang3
+        # Explicit override beats derivation from task+language.
+        override = str(opts.get("tgt_lang") or "").strip().lower()
+        if override:
+            tgt = override
+        else:
+            lang3 = _ISO2_TO_ISO3.get(lang, lang)
+            tgt = "eng" if task == "translate" else lang3
         gen: dict = {
             "tgt_lang": tgt,
             "num_beams": max(1, int(opts.get("num_beams") or 5)),
@@ -267,7 +302,7 @@ class _MoonshineHandler(_BaseHandler):
         self._resolve_device(cfg)
         self._processor = AutoProcessor.from_pretrained(cfg.model_id)
         self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            cfg.model_id, torch_dtype=self._torch_dtype,
+            cfg.model_id, **self._from_pretrained_kwargs(),
         ).to(self._torch_device)
         self._model.eval()
 
@@ -296,7 +331,7 @@ class _S2THandler(_BaseHandler):
         self._resolve_device(cfg)
         self._processor = Speech2TextProcessor.from_pretrained(cfg.model_id)
         self._model = Speech2TextForConditionalGeneration.from_pretrained(
-            cfg.model_id, torch_dtype=self._torch_dtype,
+            cfg.model_id, **self._from_pretrained_kwargs(),
         ).to(self._torch_device)
         self._model.eval()
 
@@ -311,6 +346,99 @@ class _S2THandler(_BaseHandler):
             )
         text = self._processor.batch_decode(out, skip_special_tokens=True)[0]
         return (text or "").strip()
+
+
+class _PromptedASRHandler(_BaseHandler):
+    """Shared handler for instruction-tuned audio LLMs (Voxtral,
+    Granite-Speech, Phi-4-Multimodal, Qwen2-Audio). They all share the
+    pattern: processor(audios=…, text=<instruction>) → model.generate.
+    Concrete subclasses override `_default_prompt` and `_model_cls`."""
+    _model_cls_name = "AutoModelForSpeechSeq2Seq"
+    _default_prompt = "Transcribe the audio."
+
+    def _resolve_model_cls(self):
+        # Late import — keeps a missing transformers version from
+        # breaking the whole module at import time.
+        import importlib
+        try:
+            tf = importlib.import_module("transformers")
+            return getattr(tf, self._model_cls_name)
+        except AttributeError:
+            from transformers import AutoModelForSpeechSeq2Seq
+            log.warning("%s: %s not in transformers; using "
+                        "AutoModelForSpeechSeq2Seq", self.family,
+                        self._model_cls_name)
+            return AutoModelForSpeechSeq2Seq
+
+    def load(self, cfg: LoadConfig) -> None:
+        from transformers import AutoProcessor
+        self._resolve_device(cfg)
+        self._processor = AutoProcessor.from_pretrained(
+            cfg.model_id, trust_remote_code=True,
+        )
+        cls = self._resolve_model_cls()
+        self._model = cls.from_pretrained(
+            cfg.model_id, trust_remote_code=True,
+            **self._from_pretrained_kwargs(),
+        ).to(self._torch_device)
+        self._model.eval()
+
+    def transcribe(self, audio: np.ndarray, opts: dict[str, Any]) -> str:
+        import torch
+        prompt = str(opts.get("prompt") or "").strip() or self._default_prompt
+        task = str(opts.get("task") or "transcribe")
+        if task == "translate" and "translate" not in prompt.lower():
+            prompt = "Translate the audio to English."
+        try:
+            inputs = self._processor(
+                audios=audio, sampling_rate=16000, text=prompt,
+                return_tensors="pt",
+            )
+        except TypeError:
+            # Some processors don't accept `text=`; build the input
+            # the conversational way.
+            inputs = self._processor(
+                audio, sampling_rate=16000, return_tensors="pt",
+            )
+        inputs = {k: v.to(self._torch_device,
+                          dtype=self._torch_dtype if hasattr(v, "dtype")
+                                  and v.dtype.is_floating_point else None)
+                  for k, v in inputs.items() if hasattr(v, "to")}
+        temp = float(opts.get("temperature") or 0.0)
+        top_p = float(opts.get("top_p") or 0.0)
+        gen: dict[str, Any] = {"max_new_tokens": 440}
+        if temp > 0.0:
+            gen["do_sample"] = True
+            gen["temperature"] = temp
+            if 0.0 < top_p < 1.0:
+                gen["top_p"] = top_p
+        with torch.no_grad():
+            out = self._model.generate(**inputs, **gen)
+        # Skip the prompt tokens from the decoded output when the
+        # processor doesn't do it for us.
+        text = self._processor.batch_decode(out, skip_special_tokens=True)[0]
+        return (text or "").strip()
+
+
+class _VoxtralHandler(_PromptedASRHandler):
+    family = fd.STT_VOXTRAL
+    _model_cls_name = "VoxtralForConditionalGeneration"
+    _default_prompt = ""   # Voxtral has a built-in transcription mode
+
+
+class _GraniteSpeechHandler(_PromptedASRHandler):
+    family = fd.STT_GRANITE
+    _model_cls_name = "GraniteSpeechForConditionalGeneration"
+
+
+class _Phi4MMHandler(_PromptedASRHandler):
+    family = fd.STT_PHI4MM
+    _model_cls_name = "Phi4MultimodalForCausalLM"
+
+
+class _QwenAudioHandler(_PromptedASRHandler):
+    family = fd.STT_QWEN_AUDIO
+    _model_cls_name = "Qwen2AudioForConditionalGeneration"
 
 
 class _GenericPipelineHandler(_BaseHandler):
@@ -347,16 +475,19 @@ class _GenericPipelineHandler(_BaseHandler):
 
 # Family → handler class.
 _HANDLERS: dict[str, type[_BaseHandler]] = {
-    fd.STT_WHISPER:   _WhisperHandler,
-    fd.STT_WAV2VEC2:  _Wav2Vec2Handler,
-    fd.STT_MMS:       _MMSHandler,
-    fd.STT_SEAMLESS:  _SeamlessHandler,
-    fd.STT_MOONSHINE: _MoonshineHandler,
-    fd.STT_S2T:       _S2THandler,
-    fd.STT_SPEECHT5:  _GenericPipelineHandler,
-    fd.STT_PARAKEET:  _GenericPipelineHandler,
-    fd.STT_QWEN_AUDIO:_GenericPipelineHandler,
-    fd.STT_GENERIC:   _GenericPipelineHandler,
+    fd.STT_WHISPER:    _WhisperHandler,
+    fd.STT_WAV2VEC2:   _Wav2Vec2Handler,
+    fd.STT_MMS:        _MMSHandler,
+    fd.STT_SEAMLESS:   _SeamlessHandler,
+    fd.STT_MOONSHINE:  _MoonshineHandler,
+    fd.STT_S2T:        _S2THandler,
+    fd.STT_SPEECHT5:   _GenericPipelineHandler,
+    fd.STT_QWEN_AUDIO: _QwenAudioHandler,
+    fd.STT_VOXTRAL:    _VoxtralHandler,
+    fd.STT_GRANITE:    _GraniteSpeechHandler,
+    fd.STT_PHI4MM:     _Phi4MMHandler,
+    fd.STT_VIBEVOICE:  _GenericPipelineHandler,
+    fd.STT_GENERIC:    _GenericPipelineHandler,
 }
 
 

@@ -18,8 +18,13 @@ torch>=2.4
 # Generic STT + TTS backends — one transformers install handles every
 # HF-hosted model family we support: Whisper, Wav2Vec2, HuBERT, WavLM,
 # MMS, SeamlessM4T, Moonshine, SpeechT5 (ASR + TTS), VITS / MMS-TTS,
-# Bark, Speech2Text, etc. The model architecture is auto-detected
-# from the repo's config.json at load time.
+# Bark, Speech2Text, Voxtral, Granite-Speech, Phi-4-MM, Qwen2-Audio,
+# CSM, Higgs-Audio, VibeVoice, … The model architecture is auto-
+# detected from the repo's config.json at load time.
+#
+# Voxtral needs transformers >= 4.54; Granite-Speech / CSM / Phi-4-MM
+# need the 5.x line. 4.45 stays as the minimum for the older Whisper /
+# Wav2Vec2 / MMS / Seamless families.
 transformers>=4.45
 huggingface_hub>=0.24
 
@@ -37,7 +42,23 @@ kokoro>=0.5
 # falls back to transformers.pipeline if this is missing.
 #parler-tts>=0.2
 
+# Optional: Orpheus-TTS (Llama backbone + SNAC vocoder; emotion tags).
+# The generic backend falls back to pipeline() if this is missing,
+# which won't work since Orpheus is non-standard.
+#orpheus-speech>=0.1
+
+# Optional: Coqui XTTS for voice cloning. Non-commercial license.
+#TTS>=0.22
+
 # Optional: phonemizer / espeak — needed by some VITS / Bark / Parler
 # voices. Generic backend tolerates absence (output may be empty for
 # non-English VITS).
 #phonemizer>=3.2
+
+# Optional: Flash-Attention 2 for ~1.5-2x speedup on Whisper / Voxtral /
+# Seamless. Needs fp16 or bf16 + Ampere+ (RTX 30xx / A100+). On
+# Windows there are NO official PyPI wheels — use setup.ps1 -FlashAttn
+# or manually download a wheel from
+# https://github.com/lldacing/flash-attention-windows-wheel matching
+# your torch + CUDA + Python combo.
+#flash-attn>=2.5

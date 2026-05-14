@@ -38,29 +38,50 @@ family actually honours.
 
 | Family | HF `model_type` | Loader class | Knobs the UI exposes | Example repos |
 |---|---|---|---|---|
-| **Whisper** (default) | `whisper` | `WhisperForConditionalGeneration` | language · task (transcribe/translate) · beams · initial-prompt · dtype · torch.compile | `openai/whisper-{tiny,base,small,medium,large-v3}`, `openai/whisper-large-v3-turbo`, `distil-whisper/distil-large-v3` |
-| **Wav2Vec2 / HuBERT / WavLM** | `wav2vec2`, `hubert`, `wavlm`, `unispeech`, `unispeech_sat` | `AutoModelForCTC` | dtype · torch.compile | `facebook/wav2vec2-large-960h-lv60-self`, `facebook/hubert-large-ls960-ft` |
-| **MMS** | `wav2vec2` (with adapter) | `Wav2Vec2ForCTC` + `target_lang` adapter | language (1107 langs) · dtype · torch.compile | `facebook/mms-1b-all`, `facebook/mms-1b-fl102` |
-| **SeamlessM4T v1 / v2** | `seamless_m4t`, `seamless_m4t_v2` | `SeamlessM4Tv2ForSpeechToText` | language · task · beams · dtype · torch.compile | `facebook/seamless-m4t-v2-large`, `facebook/hf-seamless-m4t-medium` |
-| **Moonshine** | `moonshine` | `AutoModelForSpeechSeq2Seq` | beams · dtype · torch.compile | `UsefulSensors/moonshine-{tiny,base}` |
-| **Speech2Text** | `speech_to_text` | `Speech2TextForConditionalGeneration` | language · beams · dtype | `facebook/s2t-small-librispeech-asr` |
-| **SpeechT5 ASR** | `speecht5` + `ForSpeechToText` arch | `transformers.pipeline` fallback | dtype | `microsoft/speecht5_asr` |
-| **Qwen2-Audio** | `qwen2_audio` | `transformers.pipeline` fallback | language · bf16 · dtype | `Qwen/Qwen2-Audio-7B-Instruct` |
-| **Parakeet** | (HF mirror) | `transformers.pipeline` fallback | beams · dtype | community Parakeet HF mirrors |
-| **Generic** (catch-all) | any with `pipeline_tag=automatic-speech-recognition` | `transformers.pipeline("automatic-speech-recognition")` | dtype · torch.compile | anything else HF registers as ASR |
+| **Whisper** (default) | `whisper` | `WhisperForConditionalGeneration` | language · task (transcribe/translate) · beams · temperature · repetition penalty · initial-prompt · dtype · attention · torch.compile | `openai/whisper-{tiny,base,small,medium,large-v3}`, `openai/whisper-large-v3-turbo`, `distil-whisper/distil-large-v3` |
+| **Wav2Vec2 / HuBERT / WavLM** | `wav2vec2`, `hubert`, `wavlm`, `unispeech`, `unispeech_sat` | `AutoModelForCTC` | dtype · attention · torch.compile | `facebook/wav2vec2-large-960h-lv60-self`, `facebook/hubert-large-ls960-ft` |
+| **MMS** | `wav2vec2` (with adapter) | `Wav2Vec2ForCTC` + `load_adapter(<ISO-639-3>)` | language (1107 langs, auto-mapped to MMS adapter) · dtype · attention · torch.compile | `facebook/mms-1b-all`, `facebook/mms-1b-fl102` |
+| **SeamlessM4T v1 / v2** | `seamless_m4t`, `seamless_m4t_v2` | `SeamlessM4Tv2ForSpeechToText` | language · task · beams · `tgt_lang` override · dtype · attention | `facebook/seamless-m4t-v2-large`, `facebook/hf-seamless-m4t-medium` |
+| **Moonshine** | `moonshine` | `AutoModelForSpeechSeq2Seq` | beams · dtype · attention · torch.compile | `UsefulSensors/moonshine-{tiny,base}` |
+| **Speech2Text** | `speech_to_text` | `Speech2TextForConditionalGeneration` | language · beams · dtype · attention | `facebook/s2t-small-librispeech-asr` |
+| **SpeechT5 ASR** | `speecht5` + `ForSpeechToText` arch | `transformers.pipeline` fallback | dtype · attention | `microsoft/speecht5_asr` |
+| **Voxtral** *(new)* | `voxtral` | `VoxtralForConditionalGeneration` (prompted ASR) | language · task · temperature · prompt · bf16 · attention | `mistralai/Voxtral-Mini-3B-2507`, `mistralai/Voxtral-Small-24B-2507` |
+| **Granite-Speech** *(new)* | `granite_speech` | `GraniteSpeechForConditionalGeneration` (prompted ASR / AST) | language · task · prompt · bf16 · attention | `ibm-granite/granite-speech-3.3-{2b,8b}` |
+| **Phi-4-Multimodal** *(new)* | `phi4_multimodal` | `Phi4MultimodalForCausalLM` (prompted) | prompt · temperature · bf16 · attention | `microsoft/Phi-4-multimodal-instruct` |
+| **Qwen2-Audio** | `qwen2_audio` | `Qwen2AudioForConditionalGeneration` (prompted) | prompt · temperature · top_p · bf16 · attention | `Qwen/Qwen2-Audio-7B-Instruct` |
+| **VibeVoice ASR** *(new)* | `vibevoice_*` | `transformers.pipeline` fallback | language · bf16 · attention | `microsoft/VibeVoice-*-ASR` |
+| **Generic** (catch-all) | any with `pipeline_tag=automatic-speech-recognition` | `transformers.pipeline("automatic-speech-recognition")` | dtype · chunk-length · attention | anything else HF registers as ASR |
 
 ### TTS families
 
 | Family | HF `model_type` | Loader | Voice catalog | Extra knobs | Example repos |
 |---|---|---|---|---|---|
-| **Kokoro** (default) | (custom) | `kokoro.KPipeline` | 54 voices, 9 langs (static) | speed · stream · torch.compile | `hexgrad/Kokoro-82M` |
-| **VITS / MMS-TTS** | `vits` | `VitsModel` + `AutoTokenizer` | one implicit voice per repo (~1107 langs total) | speed · torch.compile | `facebook/mms-tts-{eng,spa,fra,hin,deu,cmn,…}` |
-| **SpeechT5 TTS** | `speecht5` + `ForTextToSpeech` arch | `SpeechT5ForTextToSpeech` + `SpeechT5HifiGan` | 4 default x-vectors + any `dataset:row` | speaker_embedding · speed · torch.compile | `microsoft/speecht5_tts` |
-| **Bark** | `bark` | `BarkModel` + `AutoProcessor` | 11 preset speakers (en/de/es/fr/hi/ja/zh) | temperature · torch.compile | `suno/bark`, `suno/bark-small` |
-| **Parler-TTS** | (custom) | `ParlerTTSForConditionalGeneration` | 5 style presets + free-text style | style (free text) · speed · torch.compile | `parler-tts/parler-tts-{mini,large}-v1` |
-| **XTTS / Coqui** | (custom) | Coqui `TTS` if installed | reference clip → cloned voice | reference_audio · language · speed | `coqui/XTTS-v2` |
-| **Qwen3-TTS** | (custom) | `transformers.pipeline` fallback | model-defined | speed · multilingual | community Qwen-TTS mirrors |
-| **Generic** | any with `pipeline_tag=text-to-speech` | `transformers.pipeline("text-to-speech")` | one default | torch.compile | anything else HF registers as TTS |
+| **Kokoro** (default) | (custom) | `kokoro.KPipeline` | 54 voices, 9 langs (static) | speed · voice_blend · stream · attention · torch.compile | `hexgrad/Kokoro-82M` |
+| **VITS / MMS-TTS** | `vits` | `VitsModel` + `AutoTokenizer` | one implicit voice per repo (~1107 langs total) | speed · noise_scale · noise_scale_duration · seed · attention | `facebook/mms-tts-{eng,spa,fra,hin,deu,cmn,…}` |
+| **SpeechT5 TTS** | `speecht5` + `ForTextToSpeech` arch | `SpeechT5ForTextToSpeech` + HifiGAN | 4 default x-vectors + any `dataset:row` | speaker_embedding · speed · attention | `microsoft/speecht5_tts` |
+| **Bark** | `bark` | `BarkModel` + `AutoProcessor` | 11 preset speakers (en/de/es/fr/hi/ja/zh) | semantic_temperature · coarse_temperature · min_eos_p · seed · attention | `suno/bark`, `suno/bark-small` |
+| **Parler-TTS** | (custom) | `ParlerTTSForConditionalGeneration` | 5 style presets + free-text style | style · temperature · max_new_tokens · speed · attention | `parler-tts/parler-tts-{mini,large}-v1` |
+| **XTTS / Coqui** | (custom) | Coqui `TTS` if installed | reference clip → cloned voice | reference_audio · language · temperature · top_p · top_k · repetition_penalty · length_penalty · speed | `coqui/XTTS-v2` |
+| **Orpheus** *(new)* | (Llama backbone + SNAC vocoder) | `orpheus_tts.OrpheusModel` | 8 named speakers | temperature · top_p · emotion_tags · seed | `canopylabs/orpheus-3b-0.1-ft` |
+| **CSM (Sesame)** *(new)* | `csm` | `CsmForConditionalGeneration` | conversational | temperature · seed · attention | `sesame/csm-1b` |
+| **Higgs-Audio v2** *(new)* | (custom) | `AutoModelForCausalLM` (trust_remote_code) | zero-shot from reference clip | temperature · reference_audio · seed · attention | `bosonai/higgs-audio-v2-generation-3B-base` |
+| **VibeVoice** *(new)* | `vibevoice_*` | `transformers.pipeline` (trust_remote_code) | multi-speaker | temperature · attention | `microsoft/VibeVoice-1.5B` |
+| **Qwen3-TTS** | (custom) | `transformers.pipeline` fallback | model-defined | temperature · top_p · speed | community Qwen-TTS mirrors |
+| **Generic** | any with `pipeline_tag=text-to-speech` | `transformers.pipeline("text-to-speech")` | one default | torch.compile · attention | anything else HF registers as TTS |
+
+### Universal settings (every family honours these)
+
+| Setting | Type | What it does |
+|---|---|---|
+| **Device** | enum | `cpu` / `cuda`. Falls back to CPU when CUDA unavailable. |
+| **Precision** | enum | `auto` / `fp16` / `bf16` / `fp32`. `auto` = fp16 on GPU, fp32 on CPU. |
+| **Attention** | enum | `auto` / `sdpa` / `flash_attention_2` / `eager`. Pick `flash_attention_2` for ~1.5–2× speedup on Ampere+ with fp16/bf16 (install via `setup.ps1 -FlashAttn $true`). |
+| **Language** | enum | Decoder hint for multilingual STT families. Hidden for English-only families. |
+| **Idle Unload** | int | Seconds of idleness before the engine frees GPU memory. `0` = never. |
+| **torch.compile** | bool | JIT compile the model (~20–40% steady-state speedup, ~30 s first call). |
+| **Warm Up On Load** | bool | Run a dummy inference at load time so the first real call is fast. |
+| **TTS Speed** | float | 0.5–2.0× synthesis rate. |
+| **TTS Seed** | int | RNG seed for sampling families (VITS / Bark / Parler / Orpheus / Higgs). `-1` = random. |
 
 The model field accepts **any HuggingFace repo id or local model
 path**. Type it; the family pill next to the field updates instantly
@@ -93,6 +114,15 @@ cd "$env:USERPROFILE\.voxtype"
    `pythonw.exe -m voxtype` at logon (no console window)
 5. Seed `voxtype/data/settings.json` with defaults
 6. Start VoxType immediately
+
+Optional flags:
+
+| Flag | Default | What it does |
+|---|---|---|
+| `-InstallDir <path>` | `~/.voxtype` | Where the venv + scheduled task land. |
+| `-GpuSupport $true\|$false` | `$true` | Install the CUDA wheel of torch (vs. CPU-only). |
+| `-CudaVersion cu130\|cu124\|cpu` | `cu130` | Which torch wheel index. `cu130` = nightly, `cu124` = stable. |
+| `-FlashAttn $true\|$false` | `$true` | Auto-download a Flash-Attention 2 wheel matching your torch + CUDA + Python from [lldacing/flash-attention-windows-wheel](https://github.com/lldacing/flash-attention-windows-wheel) and install it. Unlocks `Attention → flash_attention_2` in Settings (~1.5–2× faster Whisper / Voxtral / Seamless on Ampere+). Auto-skipped when `-GpuSupport $false`. Pass `-FlashAttn $false` to skip on GPU too. |
 
 Re-running `setup.ps1` is idempotent at every phase.
 

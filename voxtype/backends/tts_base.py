@@ -22,6 +22,7 @@ class TTSLoadConfig:
     device: str            # "cpu" | "cuda"
     warmup: bool
     torch_compile: bool
+    attn_impl: str = "auto"  # "auto" | "sdpa" | "flash_attention_2" | "eager"
 
 
 @dataclass

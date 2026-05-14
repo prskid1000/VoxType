@@ -12,10 +12,49 @@ STT and TTS both run **in-process via PyTorch through a single
 generic backend per modality**. Paste any HuggingFace repo id (or
 local path); the backend reads `config.json`, auto-detects the
 family, and dispatches to the right loader. One transformers
-install covers Whisper, Wav2Vec2, HuBERT, WavLM, MMS, SeamlessM4T,
-Moonshine, SpeechT5 (ASR + TTS), Bark, Parler-TTS, VITS / MMS-TTS,
+install covers Whisper, Wav2Vec2/HuBERT/WavLM, MMS, SeamlessM4T,
+Moonshine, Speech2Text, SpeechT5 (ASR + TTS), Voxtral,
+Granite-Speech, Phi-4-Multimodal, Qwen2-Audio, VITS / MMS-TTS,
+Bark, Parler-TTS, XTTS, Orpheus, CSM, Higgs-Audio, VibeVoice,
 plus a `transformers.pipeline()` fallback for anything else HF
 registers as ASR / TTS.
+
+## Family coverage
+
+### STT families (handler + main per-call opts)
+
+| Family            | model_type             | Handler / loader class                     | Per-call opts                                                  | Example repo                       |
+|-------------------|------------------------|---------------------------------------------|----------------------------------------------------------------|------------------------------------|
+| Whisper           | `whisper`              | `WhisperForConditionalGeneration`           | `task`, `num_beams`, `temperature`, `repetition_penalty`, `initial_prompt` | `openai/whisper-large-v3`         |
+| Wav2Vec2 / HuBERT | `wav2vec2`/`hubert`/`wavlm` | `AutoModelForCTC` (argmax CTC)         | —                                                              | `facebook/wav2vec2-large-960h-lv60-self` |
+| MMS               | `wav2vec2` + MMS tag   | `Wav2Vec2ForCTC` + `load_adapter(<lang3>)`  | (driven by universal Language)                                | `facebook/mms-1b-all`              |
+| SeamlessM4T(v2)   | `seamless_m4t*`        | `SeamlessM4Tv2ForSpeechToText`              | `task`, `num_beams`, `tgt_lang`                                | `facebook/seamless-m4t-v2-large`   |
+| Moonshine         | `moonshine`            | `AutoModelForSpeechSeq2Seq`                 | `num_beams`                                                    | `UsefulSensors/moonshine-base`     |
+| Speech2Text       | `speech_to_text`       | `Speech2TextForConditionalGeneration`       | `num_beams`                                                    | `facebook/s2t-small-librispeech-asr` |
+| SpeechT5 ASR      | `speecht5`             | generic pipeline                            | —                                                              | `microsoft/speecht5_asr`           |
+| Voxtral           | `voxtral`              | `VoxtralForConditionalGeneration` (prompted ASR shared base) | `task`, `temperature`, `prompt`             | `mistralai/Voxtral-Mini-3B-2507`   |
+| Granite-Speech    | `granite_speech`       | `GraniteSpeechForConditionalGeneration` (prompted) | `task`, `prompt`                                      | `ibm-granite/granite-speech-3.3-8b`|
+| Phi-4-Multimodal  | `phi4_multimodal`      | `Phi4MultimodalForCausalLM` (prompted)      | `prompt`, `temperature`                                        | `microsoft/Phi-4-multimodal-instruct` |
+| Qwen2-Audio       | `qwen2_audio`          | `Qwen2AudioForConditionalGeneration` (prompted) | `prompt`, `temperature`, `top_p`                          | `Qwen/Qwen2-Audio-7B-Instruct`     |
+| VibeVoice ASR     | `vibevoice_*`          | generic pipeline                            | —                                                              | `microsoft/VibeVoice-*-ASR`        |
+| Generic ASR       | (anything pipeline-supported) | `pipeline("automatic-speech-recognition")` | —                                                       | any HF ASR repo                    |
+
+### TTS families
+
+| Family       | model_type     | Handler / loader class                        | Per-call opts                                                        | Voices                          | Example repo                    |
+|--------------|----------------|-----------------------------------------------|----------------------------------------------------------------------|---------------------------------|---------------------------------|
+| Kokoro       | (PyPI `kokoro`)| `kokoro.KPipeline`                            | `voice_blend`                                                        | 54 curated (9 langs)            | `hexgrad/Kokoro-82M`            |
+| VITS / MMS-TTS | `vits`       | `VitsModel` + `AutoTokenizer`                 | `noise_scale`, `noise_scale_duration`, `seed`                        | implicit (per-language repo)    | `facebook/mms-tts-eng`          |
+| SpeechT5     | `speecht5`     | `SpeechT5ForTextToSpeech` + HifiGan vocoder   | `speaker_embedding` (HF dataset:row)                                 | 4 curated x-vectors             | `microsoft/speecht5_tts`        |
+| Bark         | `bark`         | `BarkModel`                                   | `semantic_temperature`, `coarse_temperature`, `min_eos_p`            | 11 preset speakers              | `suno/bark`                     |
+| Parler-TTS   | (PyPI `parler_tts`) | `ParlerTTSForConditionalGeneration`      | `style`, `temperature`, `max_new_tokens`                             | 5 style presets                 | `parler-tts/parler-tts-mini-v1` |
+| XTTS         | (PyPI `TTS`)   | `TTS.api.TTS`                                 | `reference_audio`, `language`, `temperature`, `top_p`, `top_k`, `repetition_penalty`, `length_penalty` | clone from reference  | `tts_models/multilingual/multi-dataset/xtts_v2` |
+| Orpheus      | `llama` + SNAC | `orpheus_tts.OrpheusModel`                    | `temperature`, `top_p`, `emotion_tags`                               | 8 named speakers                | `canopylabs/orpheus-3b-0.1-ft`  |
+| CSM          | `csm`          | `CsmForConditionalGeneration` (native ≥ trans-formers 5.x) | `temperature`                                                  | implicit conversational         | `sesame/csm-1b`                 |
+| Higgs-Audio  | (`AutoModelForCausalLM`) | `AutoModelForCausalLM` (trust_remote_code)  | `temperature`, `reference_audio`                                     | zero-shot (reference clip)      | `bosonai/higgs-audio-v2-generation-3B-base` |
+| Qwen3-TTS    | (pipeline)     | generic pipeline                              | `temperature`, `top_p`                                               | model-dependent                 | `Qwen/Qwen3-TTS-*`              |
+| VibeVoice    | `vibevoice_*`  | `pipeline("text-to-speech")` (trust_remote_code) | `temperature`                                                  | multi-speaker                   | `microsoft/VibeVoice-1.5B`      |
+| Generic TTS  | (anything pipeline-supported) | `pipeline("text-to-speech")`   | —                                                                    | implicit                        | any HF TTS repo                 |
 
 An embedded aiohttp server exposes both engines on one
 OpenAI-compatible port (`:6600` by default) so external clients reach

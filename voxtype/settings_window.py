@@ -767,17 +767,6 @@ def _build_services(window) -> QWidget:
     t_body.addWidget(_row(_label("Speed",
         "Synthesis rate. 1.0 = normal, >1 = faster, <1 = slower."),
         _slider_float("tts_length_scale", 0.5, 2.0, 0.05, suffix="x")))
-    t_body.addWidget(_row(_label("Fallback Lang",
-        "Phonemizer fallback language for text that doesn't match the "
-        "voice prefix. a=Am-En, b=Br-En, e=es, f=fr, h=hi, i=it, j=ja, "
-        "p=pt-br, z=zh. Voice prefix still wins per call."),
-        _combo("tts_lang_code", [
-            ("a", "a — American English"), ("b", "b — British English"),
-            ("e", "e — Spanish"), ("f", "f — French"),
-            ("h", "h — Hindi"), ("i", "i — Italian"),
-            ("j", "j — Japanese"), ("p", "p — Portuguese (BR)"),
-            ("z", "z — Mandarin"),
-        ])))
     t_body.addWidget(_row(_label("Stream Audio",
         "Reply with chunked WAV — first audio plays in ~200 ms instead "
         "of waiting for the whole utterance. Big TTFB win for long text."),

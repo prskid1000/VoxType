@@ -213,9 +213,9 @@ async def handle_speech(request: web.Request) -> web.Response:
         speed = None
 
     engine = tts_engine.get_engine()
-    # Pull latest settings before each call so UI edits (lang_code /
-    # warmup / torch_compile / stream / voice / speed) take effect
-    # without a tray Reload. Cheap; only unloads on real _key() diff.
+    # Pull latest settings before each call so UI edits (voice / speed /
+    # warmup / torch_compile / stream) take effect without a tray Reload.
+    # Cheap; only unloads on real _key() diff.
     try:
         await engine.configure(config.load())
     except Exception as exc:

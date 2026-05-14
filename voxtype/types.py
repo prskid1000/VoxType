@@ -95,10 +95,6 @@ class AppSettings:
     tts_device: TorchDevice = "cpu"
     tts_speaker: str = "af_heart"
     tts_length_scale: float = 1.0      # Kokoro `speed` arg (1.0 = normal)
-    # Phonemizer fallback language for non-prefixed text. Voice prefix
-    # still overrides per call. a=Am-En, b=Br-En, e=es, f=fr, h=hi, i=it,
-    # j=ja, p=pt-br, z=zh.
-    tts_lang_code: str = "a"
     # First-call warmup — same idea as STT.
     tts_warmup: bool = True
     # torch.compile(model) — Kokoro is small so the win is smaller (~15%)

@@ -178,7 +178,6 @@ class TTSEngine:
         self._device = "cpu"
         self._speaker = DEFAULT_VOICE
         self._length_scale = 1.0
-        self._lang_code = "a"
         self._warmup = True
         self._torch_compile = False
         self._stream_default = False
@@ -225,7 +224,7 @@ class TTSEngine:
         # speaker / length_scale / stream_default are per-call.
         return (
             self._effective_model(), self._device,
-            self._lang_code, bool(self._torch_compile),
+            bool(self._torch_compile),
         )
 
     async def configure(self, s) -> None:
@@ -233,7 +232,6 @@ class TTSEngine:
         self._device = str(getattr(s, "tts_device", "cpu"))
         self._speaker = str(getattr(s, "tts_speaker", DEFAULT_VOICE) or DEFAULT_VOICE)
         self._length_scale = float(getattr(s, "tts_length_scale", 1.0) or 1.0)
-        self._lang_code = str(getattr(s, "tts_lang_code", "a") or "a")
         self._warmup = bool(getattr(s, "tts_warmup", True))
         self._torch_compile = bool(getattr(s, "tts_torch_compile", False))
         self._stream_default = bool(getattr(s, "tts_stream", False))
@@ -306,11 +304,12 @@ class TTSEngine:
             self._torch_device = "cpu"
 
         # KPipeline picks the language family from the voice prefix at
-        # synthesise time. lang_code is the fallback used when the voice
-        # prefix doesn't match a known family — default "a" (American
-        # English) keeps misaki quiet for af_*/am_* voices.
+        # synthesise time, so the init `lang_code` is purely a fallback
+        # for text without a matching voice — which never happens here
+        # since the UI restricts voice to the curated 54-voice catalog.
+        # Hardcoded "a" (American English) keeps misaki quiet.
         self._pipeline = KPipeline(
-            lang_code=self._lang_code or "a",
+            lang_code="a",
             repo_id=model_repo,
             device=self._torch_device,
         )

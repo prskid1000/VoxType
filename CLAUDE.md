@@ -148,7 +148,7 @@ Every UI toggle calls `config.patch("path.to.key", value)` which:
 
 **Forces a model rebuild** (engine `_key()` includes these):
 stt_model_path, stt_device, stt_dtype, stt_torch_compile,
-tts_model_path, tts_device, tts_lang_code, tts_torch_compile.
+tts_model_path, tts_device, tts_torch_compile.
 `configure()` notices the key change and unloads so the next request
 rebuilds.
 
@@ -197,7 +197,6 @@ class AppSettings:
     tts_device: TorchDevice = "cpu"
     tts_speaker: str = "af_heart"
     tts_length_scale: float = 1.0
-    tts_lang_code: str = "a"                  # fallback phonemizer lang
     tts_warmup: bool = True
     tts_torch_compile: bool = False           # ~15% steady-state win
     tts_stream: bool = False                  # chunked WAV reply

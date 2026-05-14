@@ -1,18 +1,19 @@
-"""Direct in-process STT inference via HuggingFace transformers + torch.
+"""STT engine orchestrator — owns lifecycle, delegates to a backend.
 
-Any HF Whisper-family repo works (multilingual or English-only,
-distilled or full). torch picks the CUDA / CPU device automatically;
-on CUDA we use fp16 for ~2× speed at negligible accuracy loss.
+The actual transcription work is done by a swappable
+`voxtype.backends.STTBackend` instance picked via
+`settings.stt_backend`. This module handles:
+  - load / unload locking
+  - idle-unload watcher
+  - status listeners
+  - rebuild-on-config-change via `_key()`
 
-Default: `openai/whisper-base` — 99 languages, ~145 MB on disk.
-
-Model source is either a local path OR a HF repo ID (auto-downloaded
-via the HF cache on first load).
+To add a new STT backend: create `voxtype/backends/<name>.py` and
+register it in `voxtype.backends.__init__`.
 """
 from __future__ import annotations
 
 import asyncio
-import gc
 import logging
 import threading
 import time
@@ -20,75 +21,33 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from voxtype.backends import get_stt_backend, stt_backend_names
+from voxtype.backends.shared import WHISPER_LANGUAGES
+from voxtype.backends.stt_base import LoadConfig, STTBackend, TranscribeOptions
+
 log = logging.getLogger("voxtype.stt_engine")
 
 
-# ── Default model ────────────────────────────────────────────────────
-# `openai/whisper-base`: 99 languages, ~145 MB. The official HF Whisper
-# weights — broadest compatibility across the transformers ecosystem.
-# Override per-install via settings.stt_model_path (any HF Whisper repo
-# or a local fine-tune). Quantization is left to the user — torch's
-# fp16 on GPU is the standard fast path; CPU runs fp32.
+# Re-export for callers that read `DEFAULT_MODEL` / language helpers.
 DEFAULT_MODEL = "openai/whisper-base"
-
-
-# ── Language catalog ─────────────────────────────────────────────────
-# All 99 languages the Whisper tokenizer recognizes, plus "auto" to
-# disable the explicit language hint and let Whisper detect from audio.
-# ISO 639-1 codes (Whisper uses these directly in `generate(language=)`).
-# Order: auto first, then alphabetised by human name for the UI combo.
-LANGUAGES: list[tuple[str, str]] = [
-    ("auto", "Auto-detect"),
-    ("af",  "Afrikaans"), ("am",  "Amharic"),   ("ar",  "Arabic"),
-    ("as",  "Assamese"),  ("az",  "Azerbaijani"),("ba",  "Bashkir"),
-    ("be",  "Belarusian"),("bn",  "Bengali"),   ("bo",  "Tibetan"),
-    ("br",  "Breton"),    ("bs",  "Bosnian"),   ("bg",  "Bulgarian"),
-    ("ca",  "Catalan"),   ("cs",  "Czech"),     ("cy",  "Welsh"),
-    ("da",  "Danish"),    ("de",  "German"),    ("el",  "Greek"),
-    ("en",  "English"),   ("es",  "Spanish"),   ("et",  "Estonian"),
-    ("eu",  "Basque"),    ("fa",  "Persian"),   ("fi",  "Finnish"),
-    ("fo",  "Faroese"),   ("fr",  "French"),    ("gl",  "Galician"),
-    ("gu",  "Gujarati"),  ("ha",  "Hausa"),     ("haw", "Hawaiian"),
-    ("he",  "Hebrew"),    ("hi",  "Hindi"),     ("hr",  "Croatian"),
-    ("ht",  "Haitian Creole"),                   ("hu",  "Hungarian"),
-    ("hy",  "Armenian"),  ("id",  "Indonesian"),("is",  "Icelandic"),
-    ("it",  "Italian"),   ("ja",  "Japanese"),  ("jw",  "Javanese"),
-    ("ka",  "Georgian"),  ("kk",  "Kazakh"),    ("km",  "Khmer"),
-    ("kn",  "Kannada"),   ("ko",  "Korean"),    ("la",  "Latin"),
-    ("lb",  "Luxembourgish"),                    ("ln",  "Lingala"),
-    ("lo",  "Lao"),       ("lt",  "Lithuanian"),("lv",  "Latvian"),
-    ("mg",  "Malagasy"),  ("mi",  "Maori"),     ("mk",  "Macedonian"),
-    ("ml",  "Malayalam"), ("mn",  "Mongolian"), ("mr",  "Marathi"),
-    ("ms",  "Malay"),     ("mt",  "Maltese"),   ("my",  "Burmese"),
-    ("ne",  "Nepali"),    ("nl",  "Dutch"),     ("nn",  "Norwegian Nynorsk"),
-    ("no",  "Norwegian"), ("oc",  "Occitan"),   ("pa",  "Punjabi"),
-    ("pl",  "Polish"),    ("ps",  "Pashto"),    ("pt",  "Portuguese"),
-    ("ro",  "Romanian"),  ("ru",  "Russian"),   ("sa",  "Sanskrit"),
-    ("sd",  "Sindhi"),    ("si",  "Sinhala"),   ("sk",  "Slovak"),
-    ("sl",  "Slovenian"), ("sn",  "Shona"),     ("so",  "Somali"),
-    ("sq",  "Albanian"),  ("sr",  "Serbian"),   ("su",  "Sundanese"),
-    ("sv",  "Swedish"),   ("sw",  "Swahili"),   ("ta",  "Tamil"),
-    ("te",  "Telugu"),    ("tg",  "Tajik"),     ("th",  "Thai"),
-    ("tk",  "Turkmen"),   ("tl",  "Tagalog"),   ("tr",  "Turkish"),
-    ("tt",  "Tatar"),     ("uk",  "Ukrainian"), ("ur",  "Urdu"),
-    ("uz",  "Uzbek"),     ("vi",  "Vietnamese"),("yi",  "Yiddish"),
-    ("yo",  "Yoruba"),    ("yue", "Cantonese"), ("zh",  "Chinese"),
-]
+LANGUAGES = WHISPER_LANGUAGES
 
 
 def all_language_codes() -> set[str]:
-    return {code for code, _ in LANGUAGES}
+    return {c for c, _ in LANGUAGES}
 
 
 def language_combo_options() -> list[tuple[str, str]]:
-    """(value, label) tuples for a QComboBox. Labels like `en — English`."""
     return [
         (code, name if code == "auto" else f"{code} — {name}")
         for code, name in LANGUAGES
     ]
 
 
-# ── Status type ──────────────────────────────────────────────────────
+def available_backends() -> list[str]:
+    """Names of STT backends that imported successfully."""
+    return stt_backend_names()
+
 
 @dataclass
 class EngineStatus:
@@ -96,6 +55,7 @@ class EngineStatus:
     ready: bool = False
     pid: int | None = None
     last_error: str = ""
+    backend: str = ""
 
     @property
     def name(self) -> str:
@@ -103,13 +63,11 @@ class EngineStatus:
 
 
 class STTEngine:
-    """Singleton — call `get_engine()` to access. Thread-safe."""
+    """Singleton — call `get_engine()`. Thread-safe."""
 
     def __init__(self) -> None:
-        self._model: Any = None
-        self._processor: Any = None
-        self._torch_device: str = "cpu"
-        self._torch_dtype: Any = None
+        self._backend: STTBackend | None = None
+        self._backend_name: str = ""
         self._model_lock = asyncio.Lock()
         self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxtype-stt")
         self._loaded_key: tuple | None = None
@@ -119,7 +77,7 @@ class STTEngine:
         self._idle_unload_sec = 0
         self._idle_watch_started = False
 
-        # Current settings.
+        # Current settings (all the user-facing knobs).
         self._model_path = ""
         self._device = "cpu"
         self._language = "en"
@@ -141,6 +99,7 @@ class STTEngine:
             ready=self._status.ready,
             pid=None,
             last_error=self._status.last_error,
+            backend=self._backend_name,
         )
 
     def _notify(self) -> None:
@@ -152,24 +111,40 @@ class STTEngine:
 
     # ── Configuration ────────────────────────────────────────────────
 
+    def _effective_backend_name(self) -> str:
+        # Default falls back to whisper if the user's choice isn't installed.
+        avail = available_backends() or ["whisper"]
+        return self._backend_name if self._backend_name in avail else avail[0]
+
     def _effective_model(self) -> str:
-        """Empty setting → use the built-in default."""
-        return self._model_path or DEFAULT_MODEL
+        if self._model_path:
+            return self._model_path
+        # When the user hasn't overridden, ask the backend.
+        if self._backend is not None:
+            return self._backend.default_model or DEFAULT_MODEL
+        return DEFAULT_MODEL
 
     def _key(self) -> tuple:
-        # Only fields that require a model rebuild belong here. dtype,
-        # torch_compile, warmup → model state. task / num_beams /
-        # initial_prompt are per-call generate() args, so changing them
-        # does NOT force an unload.
+        # Fields that require a model rebuild. Per-call kwargs (task,
+        # language, beams, prompt) are not in here.
         return (
+            self._effective_backend_name(),
             self._effective_model(), self._device,
             self._dtype_pref, bool(self._torch_compile),
         )
 
     async def configure(self, s) -> None:
+        new_backend = str(getattr(s, "stt_backend", "whisper") or "whisper")
+        if new_backend != self._backend_name:
+            # Switch backends. If a model is loaded under the old backend,
+            # drop it; the next ensure_loaded() rebuilds with the new one.
+            if self._backend is not None:
+                await self.unload()
+            self._backend_name = new_backend
+
         self._model_path = str(getattr(s, "stt_model_path", "") or "")
         self._device = str(getattr(s, "stt_device", "cpu"))
-        self._language = str(getattr(s, "stt_language", "en"))
+        self._language = str(getattr(s, "stt_language", "en") or "en")
         self._task = str(getattr(s, "stt_task", "transcribe") or "transcribe")
         self._dtype_pref = str(getattr(s, "stt_dtype", "auto") or "auto")
         self._num_beams = int(getattr(s, "stt_num_beams", 1) or 1)
@@ -179,43 +154,54 @@ class STTEngine:
         self._idle_unload_sec = int(getattr(s, "stt_idle_unload_sec", 0))
 
         if self._loaded_key is not None and self._loaded_key != self._key():
-            log.info("stt config changed — unloading current model")
+            log.info("stt config changed — unloading current backend")
             await self.unload()
 
     # ── Load / unload ────────────────────────────────────────────────
 
     async def ensure_loaded(self) -> None:
-        if self._model is not None and self._loaded_key == self._key():
+        if self._backend is not None and self._loaded_key == self._key():
             return
         async with self._model_lock:
-            if self._model is not None and self._loaded_key == self._key():
+            if self._backend is not None and self._loaded_key == self._key():
                 return
-            if self._model is not None:
+            if self._backend is not None:
                 await self._do_unload_locked()
             await self._do_load_locked()
 
     async def _do_load_locked(self) -> None:
-        model_id = self._effective_model()
-        log.info("stt loading model=%s device=%s", model_id, self._device)
+        name = self._effective_backend_name()
+        backend = get_stt_backend(name)
+        model_id = self._effective_model() or backend.default_model
+        log.info("stt loading backend=%s model=%s device=%s",
+                 name, model_id, self._device)
         self._status.last_error = ""
         self._status.running = False
         self._status.ready = False
         self._notify()
+
+        cfg = LoadConfig(
+            model_id=model_id,
+            device=self._device,
+            dtype=self._dtype_pref,
+            warmup=self._warmup,
+            torch_compile=self._torch_compile and backend.supports("torch_compile"),
+        )
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(self._exec, self._build_model, model_id)
+            await loop.run_in_executor(self._exec, backend.load_sync, cfg)
+            self._backend = backend
+            self._backend_name = name
             self._loaded_key = self._key()
             self._status.running = True
             self._status.ready = True
             self._last_used = time.monotonic()
-            log.info("stt ready (device=%s dtype=%s)",
-                     self._torch_device, self._torch_dtype)
+            log.info("stt ready (backend=%s %s)", name, backend.runtime_info())
             self._notify()
             self._ensure_idle_watcher()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             log.error("stt load failed: %s", exc)
-            self._model = None
-            self._processor = None
+            self._backend = None
             self._loaded_key = None
             self._status.running = False
             self._status.ready = False
@@ -223,79 +209,24 @@ class STTEngine:
             self._notify()
             raise
 
-    def _build_model(self, model_id: str) -> None:
-        """Sync — runs in the executor.
-
-        Resolves the torch device with graceful CPU fallback:
-        device='cuda' but torch.cuda.is_available() == False → CPU.
-        Dtype defaults to fp16 on GPU / fp32 on CPU; overridable via
-        stt_dtype (fp32/fp16/bf16). bf16 needs Ampere+.
-        """
-        import torch
-        from transformers import WhisperForConditionalGeneration, AutoProcessor
-
-        on_cuda = self._device == "cuda" and torch.cuda.is_available()
-        if self._device == "cuda" and not on_cuda:
-            log.warning("stt: device=cuda requested but torch.cuda.is_available()=False — using CPU")
-        self._torch_device = "cuda" if on_cuda else "cpu"
-
-        pref = (self._dtype_pref or "auto").lower()
-        if pref == "auto":
-            self._torch_dtype = torch.float16 if on_cuda else torch.float32
-        elif pref == "fp16":
-            if not on_cuda:
-                log.warning("stt: fp16 requested on CPU — falling back to fp32")
-                self._torch_dtype = torch.float32
-            else:
-                self._torch_dtype = torch.float16
-        elif pref == "bf16":
-            self._torch_dtype = torch.bfloat16
-        else:
-            self._torch_dtype = torch.float32
-
-        self._processor = AutoProcessor.from_pretrained(model_id)
-        self._model = WhisperForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=self._torch_dtype,
-        ).to(self._torch_device)
-        self._model.eval()
-
-        if self._torch_compile:
-            try:
-                log.info("stt torch.compile() — first call will pause for JIT")
-                self._model = torch.compile(self._model, mode="reduce-overhead")
-            except Exception as exc:
-                log.warning("stt: torch.compile failed (%s) — running uncompiled", exc)
-
-        if self._warmup:
-            try:
-                import numpy as np
-                dummy = np.zeros(16000, dtype=np.int16).tobytes()
-                self._do_transcribe(dummy, self._language or "en")
-                log.info("stt warmup ok")
-            except Exception as exc:
-                log.warning("stt: warmup failed (%s) — first real call may be slow", exc)
-
     async def unload(self) -> None:
         async with self._model_lock:
             await self._do_unload_locked()
 
     async def _do_unload_locked(self) -> None:
-        if self._model is None:
+        if self._backend is None:
             return
-        log.info("stt unloading")
-        self._model = None
-        self._processor = None
+        log.info("stt unloading backend=%s", self._backend_name)
+        be = self._backend
+        self._backend = None
         self._loaded_key = None
         self._status.running = False
         self._status.ready = False
         self._notify()
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        gc.collect()
+            be.unload_sync()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("stt unload exc (%s)", exc)
 
     # ── Transcription ────────────────────────────────────────────────
 
@@ -303,45 +234,18 @@ class STTEngine:
         """Run STT on raw 16 kHz mono int16 PCM. Returns the text."""
         await self.ensure_loaded()
         self._last_used = time.monotonic()
+        assert self._backend is not None
         lang = (language or self._language or "en").strip() or "en"
+        opts = TranscribeOptions(
+            language=lang,
+            task=self._task if self._backend.supports("task_translate") or self._task == "transcribe" else "transcribe",
+            num_beams=self._num_beams if self._backend.supports("num_beams") else 1,
+            initial_prompt=self._initial_prompt if self._backend.supports("initial_prompt") else "",
+        )
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self._exec, self._do_transcribe, pcm, lang)
-
-    def _do_transcribe(self, pcm: bytes, language: str) -> str:
-        """Sync — runs in the executor."""
-        import numpy as np
-        import torch
-
-        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        inputs = self._processor(
-            audio, sampling_rate=16000, return_tensors="pt",
+        return await loop.run_in_executor(
+            self._exec, self._backend.transcribe_sync, pcm, opts,
         )
-        input_features = inputs.input_features.to(
-            self._torch_device, dtype=self._torch_dtype,
-        )
-
-        gen_kwargs: dict = {
-            "task": self._task or "transcribe",
-            "max_new_tokens": 440,
-            "num_beams": max(1, int(self._num_beams or 1)),
-        }
-        # `auto` = let Whisper detect language from the audio. Any other
-        # value is passed through as the explicit hint.
-        if language and language.lower() != "auto":
-            gen_kwargs["language"] = language
-        if self._initial_prompt:
-            try:
-                prompt_ids = self._processor.get_prompt_ids(
-                    self._initial_prompt, return_tensors="pt",
-                ).to(self._torch_device)
-                gen_kwargs["prompt_ids"] = prompt_ids
-            except Exception as exc:
-                log.debug("stt: prompt_ids unsupported (%s) — skipping", exc)
-
-        with torch.no_grad():
-            generated = self._model.generate(input_features, **gen_kwargs)
-        text = self._processor.batch_decode(generated, skip_special_tokens=True)[0]
-        return (text or "").strip()
 
     # ── Idle unload watcher ──────────────────────────────────────────
 
@@ -354,7 +258,7 @@ class STTEngine:
             INTERVAL = 30.0
             while True:
                 time.sleep(INTERVAL)
-                if self._model is None:
+                if self._backend is None:
                     continue
                 if self._idle_unload_sec <= 0:
                     continue

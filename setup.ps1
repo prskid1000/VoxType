@@ -158,14 +158,21 @@ if (-not (Test-Path "$voxVenv\Lib\site-packages\torch")) {
 $torchCudaCheck = & $voxPython -c "import torch; print(torch.version.cuda or 'cpu')" 2>$null
 Ok "torch installed (cuda=$torchCudaCheck)"
 
-# ── Remaining deps (PySide6, transformers, kokoro, …) ───────────────
-Write-Host "    pip install remaining deps (PySide6, transformers, kokoro, …)..." -ForegroundColor DarkGray
+# ── Remaining deps (PySide6 + STT/TTS backends) ─────────────────────
+# STT backends: transformers (whisper) + faster-whisper (CTranslate2).
+# TTS backends: kokoro (PyTorch) + piper-tts (ONNX).
+Write-Host "    pip install remaining deps (PySide6 + STT/TTS backends)..." -ForegroundColor DarkGray
 & "$voxVenv\Scripts\pip.exe" install -r "$voxTypeDir\requirements.txt" --no-cache-dir --quiet 2>&1 | Out-Null
 
 if (-not (Test-Path "$voxVenv\Lib\site-packages\PySide6")) { Fail "VoxType UI pip install failed" }
-if (-not (Test-Path "$voxVenv\Lib\site-packages\transformers")) { Fail "transformers install failed (STT backend)" }
-if (-not (Test-Path "$voxVenv\Lib\site-packages\kokoro")) { Fail "kokoro install failed (TTS backend)" }
-Ok "Core deps installed (UI + STT via transformers + TTS via kokoro, both on torch)"
+if (-not (Test-Path "$voxVenv\Lib\site-packages\transformers")) { Fail "transformers install failed (whisper backend)" }
+if (-not (Test-Path "$voxVenv\Lib\site-packages\kokoro")) { Fail "kokoro install failed (kokoro TTS backend)" }
+# faster-whisper / piper-tts are optional — log if missing but don't fail.
+$fw_ok = Test-Path "$voxVenv\Lib\site-packages\faster_whisper"
+$pi_ok = Test-Path "$voxVenv\Lib\site-packages\piper"
+if (-not $fw_ok) { Write-Host "    (info) faster-whisper not installed — only the 'whisper' STT backend will be selectable" -ForegroundColor DarkYellow }
+if (-not $pi_ok) { Write-Host "    (info) piper-tts not installed — only the 'kokoro' TTS backend will be selectable" -ForegroundColor DarkYellow }
+Ok "Backends installed (STT: whisper$(if($fw_ok){' + faster-whisper'}), TTS: kokoro$(if($pi_ok){' + piper'}))"
 
 # ─── Pre-download default models (idempotent) ────────────────────────
 #

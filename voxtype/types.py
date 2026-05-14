@@ -13,6 +13,11 @@ PillState = Literal["idle", "recording", "processing", "enhancing", "typing", "e
 HotkeyMode = Literal["hold", "toggle"]
 # torch device preference. Used by both STT and TTS engines.
 TorchDevice = Literal["cpu", "cuda"]
+# Pluggable engine backend names. Real list comes from
+# voxtype.backends.{stt,tts}_backend_names() at runtime — these literals
+# are just for type-hint clarity. Unknown values fall back to defaults.
+STTBackendName = Literal["whisper", "faster-whisper"]
+TTSBackendName = Literal["kokoro", "piper"]
 # Inference precision. `auto` = fp16 on CUDA, fp32 on CPU. `bf16` needs
 # Ampere+ (RTX 30xx / A100+) — same speed as fp16, wider numeric range.
 TorchDtype = Literal["auto", "fp32", "fp16", "bf16"]
@@ -62,6 +67,10 @@ class AppSettings:
     stt_enabled: bool = True
     stt_auto_start: bool = True
     stt_idle_unload_sec: int = 300
+    # Pluggable backend. "whisper" = HuggingFace transformers (default,
+    # broadest feature set). "faster-whisper" = CTranslate2, ~4× faster
+    # on GPU with int8 CPU mode.
+    stt_backend: STTBackendName = "whisper"
     stt_model_path: str = "openai/whisper-base"
     stt_device: TorchDevice = "cpu"
     stt_language: str = "en"
@@ -91,6 +100,10 @@ class AppSettings:
     tts_enabled: bool = False
     tts_auto_start: bool = False
     tts_idle_unload_sec: int = 600
+    # Pluggable backend. "kokoro" = official kokoro PyTorch (default,
+    # 54 voices, 9 langs). "piper" = ONNX-based, ~150 voices in 30+ langs,
+    # tiny memory footprint.
+    tts_backend: TTSBackendName = "kokoro"
     tts_model_path: str = "hexgrad/Kokoro-82M"
     tts_device: TorchDevice = "cpu"
     tts_speaker: str = "af_heart"

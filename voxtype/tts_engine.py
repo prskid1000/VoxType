@@ -1,32 +1,20 @@
-"""Direct in-process TTS inference via the `kokoro` PyPI package.
+"""TTS engine orchestrator — owns lifecycle, delegates to a backend.
 
-Kokoro-82M is an open-weight TTS model with 54 named voices spanning
-nine language families: American + British English, Spanish, French,
-Hindi, Italian, Japanese, Brazilian Portuguese, and Mandarin Chinese.
-The package wraps PyTorch (so CUDA / CPU switching is just a torch
-device move) and uses `misaki` + espeak-ng for phonemization.
+The actual synthesis is done by a swappable
+`voxtype.backends.TTSBackend` instance picked via
+`settings.tts_backend`. This module handles:
+  - load / unload locking
+  - idle-unload watcher
+  - status listeners
+  - per-call streaming bridge (sync generator → async queue → caller)
+  - rebuild-on-config-change via `_key()`
 
-Default model:  `hexgrad/Kokoro-82M` (~327 MB on disk)
-Default voice:  `af_heart` — American female "Heart"
-
-Voice names are strings prefixed by language + gender:
-    a{f,m}_*  — American English (e.g. af_heart, am_adam)
-    b{f,m}_*  — British English  (e.g. bf_emma, bm_george)
-    e{f,m}_*  — Spanish
-    f{f,m}_*  — French
-    h{f,m}_*  — Hindi
-    i{f,m}_*  — Italian
-    j{f,m}_*  — Japanese (e.g. jf_alpha, jm_kumo)
-    p{f,m}_*  — Brazilian Portuguese
-    z{f,m}_*  — Mandarin Chinese (e.g. zf_xiaobei, zm_yunjian)
-
-OpenAI-compatible `voice` request field accepts the same strings.
-Empty falls back to `tts_speaker` from settings.
+To add a new TTS backend: create `voxtype/backends/<name>.py` and
+register it in `voxtype.backends.__init__`.
 """
 from __future__ import annotations
 
 import asyncio
-import gc
 import io
 import logging
 import threading
@@ -36,114 +24,59 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from voxtype.backends import get_tts_backend, tts_backend_names
+from voxtype.backends.tts_base import TTSBackend, TTSLoadConfig
+
 log = logging.getLogger("voxtype.tts_engine")
 
 
-# ── Default model ────────────────────────────────────────────────────
-# `hexgrad/Kokoro-82M` is the official upstream Kokoro release. The
-# `kokoro` PyPI package auto-resolves repo + voice files from the HF
-# cache (`~/.cache/huggingface/hub/`).
+# Re-exports for legacy callers / the UI.
 DEFAULT_MODEL = "hexgrad/Kokoro-82M"
 DEFAULT_VOICE = "af_heart"
 
 
-# ── Voice catalog ────────────────────────────────────────────────────
-# All 54 Kokoro-82M voices, grouped by (lang_family, gender) for UI
-# rendering. Format: list of (voice_id, gender, display_name).
-# Lang families: a=Am-En, b=Br-En, e=es, f=fr, h=hi, i=it, j=ja,
-# p=pt-br, z=zh. Source: hexgrad/Kokoro-82M model card.
-VOICES: dict[str, list[tuple[str, str, str]]] = {
-    "American English": [
-        ("af_alloy",   "F", "Alloy"),
-        ("af_aoede",   "F", "Aoede"),
-        ("af_bella",   "F", "Bella"),
-        ("af_heart",   "F", "Heart"),
-        ("af_jessica", "F", "Jessica"),
-        ("af_kore",    "F", "Kore"),
-        ("af_nicole",  "F", "Nicole"),
-        ("af_nova",    "F", "Nova"),
-        ("af_river",   "F", "River"),
-        ("af_sarah",   "F", "Sarah"),
-        ("af_sky",     "F", "Sky"),
-        ("am_adam",    "M", "Adam"),
-        ("am_echo",    "M", "Echo"),
-        ("am_eric",    "M", "Eric"),
-        ("am_fenrir",  "M", "Fenrir"),
-        ("am_liam",    "M", "Liam"),
-        ("am_michael", "M", "Michael"),
-        ("am_onyx",    "M", "Onyx"),
-        ("am_puck",    "M", "Puck"),
-        ("am_santa",   "M", "Santa"),
-    ],
-    "British English": [
-        ("bf_alice",    "F", "Alice"),
-        ("bf_emma",     "F", "Emma"),
-        ("bf_isabella", "F", "Isabella"),
-        ("bf_lily",     "F", "Lily"),
-        ("bm_daniel",   "M", "Daniel"),
-        ("bm_fable",    "M", "Fable"),
-        ("bm_george",   "M", "George"),
-        ("bm_lewis",    "M", "Lewis"),
-    ],
-    "Spanish": [
-        ("ef_dora",  "F", "Dora"),
-        ("em_alex",  "M", "Alex"),
-        ("em_santa", "M", "Santa"),
-    ],
-    "French": [
-        ("ff_siwis", "F", "Siwis"),
-    ],
-    "Hindi": [
-        ("hf_alpha", "F", "Alpha"),
-        ("hf_beta",  "F", "Beta"),
-        ("hm_omega", "M", "Omega"),
-        ("hm_psi",   "M", "Psi"),
-    ],
-    "Italian": [
-        ("if_sara",   "F", "Sara"),
-        ("im_nicola", "M", "Nicola"),
-    ],
-    "Japanese": [
-        ("jf_alpha",      "F", "Alpha"),
-        ("jf_gongitsune", "F", "Gongitsune"),
-        ("jf_nezumi",     "F", "Nezumi"),
-        ("jf_tebukuro",   "F", "Tebukuro"),
-        ("jm_kumo",       "M", "Kumo"),
-    ],
-    "Brazilian Portuguese": [
-        ("pf_dora",  "F", "Dora"),
-        ("pm_alex",  "M", "Alex"),
-        ("pm_santa", "M", "Santa"),
-    ],
-    "Mandarin Chinese": [
-        ("zf_xiaobei",  "F", "Xiaobei"),
-        ("zf_xiaoni",   "F", "Xiaoni"),
-        ("zf_xiaoxiao", "F", "Xiaoxiao"),
-        ("zf_xiaoyi",   "F", "Xiaoyi"),
-        ("zm_yunjian",  "M", "Yunjian"),
-        ("zm_yunxi",    "M", "Yunxi"),
-        ("zm_yunxia",   "M", "Yunxia"),
-        ("zm_yunyang",  "M", "Yunyang"),
-    ],
-}
+def available_backends() -> list[str]:
+    return tts_backend_names()
 
 
-def all_voice_ids() -> set[str]:
-    """Flat set of every known Kokoro voice id."""
-    return {vid for group in VOICES.values() for vid, _, _ in group}
+def _backend_voice_options(backend_name: str) -> list[tuple[str, str]]:
+    """Voice catalog for the named backend (used by the settings UI)."""
+    try:
+        be = get_tts_backend(backend_name)
+        return be.voice_combo_options()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("voice options for %r unavailable: %s", backend_name, exc)
+        return []
 
 
-def voice_combo_options() -> list[tuple[str, str]]:
-    """Returns (value, label) tuples suitable for a QComboBox.
-    Label format: `af_heart  ·  American English · F · Heart`."""
-    out: list[tuple[str, str]] = []
-    for lang, items in VOICES.items():
-        for vid, gender, name in items:
-            out.append((vid, f"{vid}  ·  {lang} · {gender} · {name}"))
-    return out
+def voice_combo_options(backend_name: str | None = None) -> list[tuple[str, str]]:
+    """Backwards-compatible voice combo helper used by the UI.
+    When backend_name is None, defaults to the kokoro catalog so callers
+    that don't yet know about pluggable backends still work."""
+    return _backend_voice_options(backend_name or "kokoro")
 
 
-# ── Status type ──────────────────────────────────────────────────────
+def all_voice_ids(backend_name: str | None = None) -> set[str]:
+    try:
+        be = get_tts_backend(backend_name or "kokoro")
+        return be.voice_ids()
+    except Exception:
+        return set()
+
+
+def default_voice_for(backend_name: str) -> str:
+    try:
+        return get_tts_backend(backend_name).default_voice
+    except Exception:
+        return DEFAULT_VOICE
+
+
+def default_model_for(backend_name: str) -> str:
+    try:
+        return get_tts_backend(backend_name).default_model
+    except Exception:
+        return DEFAULT_MODEL
+
 
 @dataclass
 class TTSStatus:
@@ -151,6 +84,7 @@ class TTSStatus:
     ready: bool = False
     pid: int | None = None
     last_error: str = ""
+    backend: str = ""
 
     @property
     def name(self) -> str:
@@ -161,7 +95,8 @@ class TTSEngine:
     """Singleton — call `get_engine()`. Thread-safe."""
 
     def __init__(self) -> None:
-        self._pipeline: Any = None
+        self._backend: TTSBackend | None = None
+        self._backend_name: str = ""
         self._model_lock = asyncio.Lock()
         self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voxtype-tts")
         self._loaded_key: tuple | None = None
@@ -170,13 +105,11 @@ class TTSEngine:
         self._last_used = 0.0
         self._idle_unload_sec = 0
         self._idle_watch_started = False
-        self._sample_rate = 24000   # kokoro default
-        self._torch_device = "cpu"
 
         # Current settings.
         self._model_path = ""
         self._device = "cpu"
-        self._speaker = DEFAULT_VOICE
+        self._speaker = ""
         self._length_scale = 1.0
         self._warmup = True
         self._torch_compile = False
@@ -193,6 +126,7 @@ class TTSEngine:
             ready=self._status.ready,
             pid=None,
             last_error=self._status.last_error,
+            backend=self._backend_name,
         )
 
     def _notify(self) -> None:
@@ -204,33 +138,43 @@ class TTSEngine:
 
     # ── Configuration ────────────────────────────────────────────────
 
+    def _effective_backend_name(self) -> str:
+        avail = available_backends() or ["kokoro"]
+        return self._backend_name if self._backend_name in avail else avail[0]
+
     def _effective_model(self) -> str:
-        """Empty setting → use the built-in default."""
-        return self._model_path or DEFAULT_MODEL
+        if self._model_path:
+            return self._model_path
+        if self._backend is not None:
+            return self._backend.default_model
+        return default_model_for(self._effective_backend_name())
 
     def _effective_voice(self) -> str:
         v = (self._speaker or "").strip()
         if not v:
-            return DEFAULT_VOICE
-        # Reject leftover integer-speaker values from the pre-PyTorch era
-        # ("0", "1", …) and anything that doesn't look like a Kokoro voice
-        # id (prefix is two letters then underscore).
-        if v.isdigit() or len(v) < 4 or v[2] != "_":
-            return DEFAULT_VOICE
+            return default_voice_for(self._effective_backend_name())
+        # Reject leftover legacy values that can't be voice ids.
+        if v.isdigit() or len(v) < 3:
+            return default_voice_for(self._effective_backend_name())
         return v
 
     def _key(self) -> tuple:
-        # Only fields that require a pipeline rebuild belong here.
-        # speaker / length_scale / stream_default are per-call.
         return (
+            self._effective_backend_name(),
             self._effective_model(), self._device,
             bool(self._torch_compile),
         )
 
     async def configure(self, s) -> None:
+        new_backend = str(getattr(s, "tts_backend", "kokoro") or "kokoro")
+        if new_backend != self._backend_name:
+            if self._backend is not None:
+                await self.unload()
+            self._backend_name = new_backend
+
         self._model_path = str(getattr(s, "tts_model_path", "") or "")
         self._device = str(getattr(s, "tts_device", "cpu"))
-        self._speaker = str(getattr(s, "tts_speaker", DEFAULT_VOICE) or DEFAULT_VOICE)
+        self._speaker = str(getattr(s, "tts_speaker", "") or "")
         self._length_scale = float(getattr(s, "tts_length_scale", 1.0) or 1.0)
         self._warmup = bool(getattr(s, "tts_warmup", True))
         self._torch_compile = bool(getattr(s, "tts_torch_compile", False))
@@ -238,12 +182,12 @@ class TTSEngine:
         self._idle_unload_sec = int(getattr(s, "tts_idle_unload_sec", 0))
 
         if self._loaded_key is not None and self._loaded_key != self._key():
-            log.info("tts config changed — unloading current model")
+            log.info("tts config changed — unloading current backend")
             await self.unload()
 
     @property
     def sample_rate(self) -> int:
-        return self._sample_rate
+        return self._backend.sample_rate if self._backend is not None else 24000
 
     @property
     def stream_default(self) -> bool:
@@ -252,36 +196,47 @@ class TTSEngine:
     # ── Load / unload ────────────────────────────────────────────────
 
     async def ensure_loaded(self) -> None:
-        if self._pipeline is not None and self._loaded_key == self._key():
+        if self._backend is not None and self._loaded_key == self._key():
             return
         async with self._model_lock:
-            if self._pipeline is not None and self._loaded_key == self._key():
+            if self._backend is not None and self._loaded_key == self._key():
                 return
-            if self._pipeline is not None:
+            if self._backend is not None:
                 await self._do_unload_locked()
             await self._do_load_locked()
 
     async def _do_load_locked(self) -> None:
-        model = self._effective_model()
-        log.info("tts loading model=%s device=%s", model, self._device)
+        name = self._effective_backend_name()
+        backend = get_tts_backend(name)
+        model_id = self._effective_model() or backend.default_model
+        log.info("tts loading backend=%s model=%s device=%s",
+                 name, model_id, self._device)
         self._status.last_error = ""
         self._status.running = False
         self._status.ready = False
         self._notify()
+
+        cfg = TTSLoadConfig(
+            model_id=model_id,
+            device=self._device,
+            warmup=self._warmup,
+            torch_compile=self._torch_compile and backend.supports("torch_compile"),
+        )
         loop = asyncio.get_event_loop()
         try:
-            await loop.run_in_executor(self._exec, self._build_pipeline, model)
+            await loop.run_in_executor(self._exec, backend.load_sync, cfg)
+            self._backend = backend
+            self._backend_name = name
             self._loaded_key = self._key()
             self._status.running = True
             self._status.ready = True
             self._last_used = time.monotonic()
-            log.info("tts ready (device=%s sample_rate=%d Hz)",
-                     self._torch_device, self._sample_rate)
+            log.info("tts ready (backend=%s %s)", name, backend.runtime_info())
             self._notify()
             self._ensure_idle_watcher()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             log.error("tts load failed: %s", exc)
-            self._pipeline = None
+            self._backend = None
             self._loaded_key = None
             self._status.running = False
             self._status.ready = False
@@ -289,130 +244,88 @@ class TTSEngine:
             self._notify()
             raise
 
-    def _build_pipeline(self, model_repo: str) -> None:
-        """Sync — runs in the executor. Builds a `kokoro.KPipeline` on
-        the resolved torch device. The pipeline lazy-loads voice tensors
-        from the HF cache on first synthesise per voice."""
-        import torch
-        from kokoro import KPipeline
-
-        if self._device == "cuda" and torch.cuda.is_available():
-            self._torch_device = "cuda"
-        else:
-            if self._device == "cuda":
-                log.warning("tts: device=cuda requested but torch.cuda.is_available()=False — using CPU")
-            self._torch_device = "cpu"
-
-        # KPipeline picks the language family from the voice prefix at
-        # synthesise time, so the init `lang_code` is purely a fallback
-        # for text without a matching voice — which never happens here
-        # since the UI restricts voice to the curated 54-voice catalog.
-        # Hardcoded "a" (American English) keeps misaki quiet.
-        self._pipeline = KPipeline(
-            lang_code="a",
-            repo_id=model_repo,
-            device=self._torch_device,
-        )
-
-        if self._torch_compile:
-            try:
-                inner = getattr(self._pipeline, "model", None)
-                if inner is not None:
-                    log.info("tts torch.compile() — first synth will pause for JIT")
-                    self._pipeline.model = torch.compile(inner, mode="reduce-overhead")
-            except Exception as exc:
-                log.warning("tts: torch.compile failed (%s) — running uncompiled", exc)
-
-        if self._warmup:
-            try:
-                _ = self._do_synthesize(
-                    "Voxtype ready.", self._effective_voice(), self._length_scale,
-                )
-                log.info("tts warmup ok")
-            except Exception as exc:
-                log.warning("tts: warmup failed (%s) — first real call may be slow", exc)
-
     async def unload(self) -> None:
         async with self._model_lock:
             await self._do_unload_locked()
 
     async def _do_unload_locked(self) -> None:
-        if self._pipeline is None:
+        if self._backend is None:
             return
-        log.info("tts unloading")
-        self._pipeline = None
+        log.info("tts unloading backend=%s", self._backend_name)
+        be = self._backend
+        self._backend = None
         self._loaded_key = None
         self._status.running = False
         self._status.ready = False
         self._notify()
         try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        gc.collect()
+            be.unload_sync()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("tts unload exc (%s)", exc)
 
     # ── Synthesis ────────────────────────────────────────────────────
+
+    def _resolve_call(self, voice: str | None, speed: float | None) -> tuple[str, float]:
+        v = (voice or "").strip() if isinstance(voice, str) else ""
+        if not v:
+            v = self._effective_voice()
+        # Speed only applies if the backend honours it.
+        backend = self._backend
+        supports_speed = backend.supports("speed") if backend is not None else True
+        if not supports_speed:
+            return v, 1.0
+        spd = float(speed) if (speed and speed > 0) else float(self._length_scale or 1.0)
+        return v, spd
 
     async def synthesize(self, text: str,
                           voice: str | None = None,
                           speed: float | None = None) -> bytes:
-        """Return WAV bytes (16-bit mono, 24 kHz).
-
-        `voice`: Kokoro voice name (e.g. `af_heart`, `jm_kumo`). Empty
-            or None → falls back to settings.tts_speaker.
-        `speed`: OpenAI-shape (1.0 = normal). Maps to Kokoro pipeline's
-            `speed` arg directly.
-        """
+        """Return WAV bytes (16-bit mono, backend's native sample rate)."""
         await self.ensure_loaded()
+        assert self._backend is not None
         self._last_used = time.monotonic()
-        v = (voice or "").strip() if isinstance(voice, str) else ""
-        if not v:
-            v = self._effective_voice()
-        spd = float(speed) if (speed and speed > 0) else float(self._length_scale or 1.0)
+        v, spd = self._resolve_call(voice, speed)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            self._exec, self._do_synthesize, text, v, spd,
-        )
+        return await loop.run_in_executor(self._exec, self._collect_wav, text, v, spd)
+
+    def _collect_wav(self, text: str, voice: str, speed: float) -> bytes:
+        """Drain the backend's sync chunk generator into a single WAV."""
+        assert self._backend is not None
+        parts: list[bytes] = []
+        for chunk in self._backend.synth_chunks_sync(text, voice, speed):
+            if chunk:
+                parts.append(chunk)
+        pcm = b"".join(parts)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self._backend.sample_rate)
+            wf.writeframes(pcm)
+        return buf.getvalue()
 
     async def synthesize_pcm_chunks(
         self, text: str,
         voice: str | None = None,
         speed: float | None = None,
     ):
-        """Async generator yielding raw int16 PCM chunks (mono, sample_rate Hz).
-
-        Each yielded chunk is one Kokoro sentence's worth of audio. The
-        HTTP layer wraps this into a streaming WAV response so external
-        clients hear the first sentence in ~200 ms instead of waiting
-        for the whole utterance.
-        """
+        """Async generator yielding raw int16 PCM chunks (mono).
+        Server side wraps them in a chunked WAV response."""
         await self.ensure_loaded()
+        assert self._backend is not None
         self._last_used = time.monotonic()
-        v = (voice or "").strip() if isinstance(voice, str) else ""
-        if not v:
-            v = self._effective_voice()
-        spd = float(speed) if (speed and speed > 0) else float(self._length_scale or 1.0)
+        v, spd = self._resolve_call(voice, speed)
 
         loop = asyncio.get_event_loop()
-        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=8)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=8)
 
         def _producer() -> None:
-            import numpy as np
-            import torch
             try:
-                for _, _, audio in self._pipeline(text, voice=v, speed=spd):
-                    if audio is None:
+                assert self._backend is not None
+                for chunk in self._backend.synth_chunks_sync(text, v, spd):
+                    if not chunk:
                         continue
-                    if isinstance(audio, torch.Tensor):
-                        arr = audio.detach().cpu().to(torch.float32).numpy()
-                    else:
-                        arr = np.asarray(audio, dtype=np.float32)
-                    arr = arr.reshape(-1)
-                    np.clip(arr, -1.0, 1.0, out=arr)
-                    pcm = (arr * 32767.0).astype(np.int16).tobytes()
-                    asyncio.run_coroutine_threadsafe(queue.put(pcm), loop).result()
+                    asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result()
             finally:
                 asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
 
@@ -422,40 +335,6 @@ class TTSEngine:
             if chunk is None:
                 return
             yield chunk
-
-    def _do_synthesize(self, text: str, voice: str, speed: float) -> bytes:
-        """Sync — runs in the executor. Returns WAV bytes.
-
-        KPipeline yields per-sentence chunks; we concatenate the audio
-        tensors into one waveform and write a single WAV.
-        """
-        import numpy as np
-        import torch
-
-        chunks: list[np.ndarray] = []
-        for _, _, audio in self._pipeline(text, voice=voice, speed=speed):
-            if audio is None:
-                continue
-            if isinstance(audio, torch.Tensor):
-                arr = audio.detach().cpu().to(torch.float32).numpy()
-            else:
-                arr = np.asarray(audio, dtype=np.float32)
-            chunks.append(arr.reshape(-1))
-
-        if not chunks:
-            samples = np.zeros(0, dtype=np.float32)
-        else:
-            samples = np.concatenate(chunks)
-
-        np.clip(samples, -1.0, 1.0, out=samples)
-        int16 = (samples * 32767.0).astype(np.int16)
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(self._sample_rate)
-            wf.writeframes(int16.tobytes())
-        return buf.getvalue()
 
     # ── Idle unload watcher ──────────────────────────────────────────
 
@@ -468,7 +347,7 @@ class TTSEngine:
             INTERVAL = 30.0
             while True:
                 time.sleep(INTERVAL)
-                if self._pipeline is None:
+                if self._backend is None:
                     continue
                 if self._idle_unload_sec <= 0:
                     continue

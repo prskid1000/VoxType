@@ -15,12 +15,16 @@ pywin32>=306; platform_system == "Windows"
 # picks the right index URL based on -GpuSupport.
 torch>=2.4
 
-# STT — generic, via HuggingFace transformers. Any HF Whisper-family
-# repo works (encoder/decoder/processor all in one package).
+# STT backends — pluggable. `whisper` is the default (transformers
+# reference impl); `faster-whisper` is the CTranslate2 alternative
+# (~4× faster GPU, int8 CPU). Both are Whisper-family and share the
+# HF model cache.
 transformers>=4.45
 huggingface_hub>=0.24
+faster-whisper>=1.0      # CTranslate2-based Whisper backend
 
-# TTS — Kokoro-82M via the official `kokoro` PyPI package. Pure
-# PyTorch (so CUDA / CPU comes for free from torch above). Pulls in
-# misaki (G2P) and uses system espeak-ng for non-English fallback.
+# TTS backends — pluggable. `kokoro` is the default (PyTorch, 54
+# voices, 9 langs); `piper` is the lightweight ONNX alternative
+# (~150 voices, 30+ langs, ~50 MB/voice, fast on CPU).
 kokoro>=0.5
+piper-tts>=1.2           # rhasspy/piper, ONNX-based

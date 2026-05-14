@@ -78,31 +78,64 @@ Cross-thread handoff is Qt signals (pill state) or
 `QTimer.singleShot(0, lambda: …)` (pulling async results back to the
 Qt thread).
 
-## In-process engines
+## Pluggable engine backends
 
-Both `stt_engine.py` and `tts_engine.py` are singletons, both PyTorch
-backed, both with the same lifecycle API:
+`stt_engine.py` and `tts_engine.py` are **thin orchestrators**. The
+actual model code lives in `voxtype/backends/<name>.py` and implements
+the `STTBackend` / `TTSBackend` ABC defined in
+`backends/stt_base.py` / `backends/tts_base.py`.
+
+The orchestrator owns:
+- load / unload locking + idle-unload watcher
+- status listeners + the `_key()` rebuild trigger
+- the single-thread `ThreadPoolExecutor` for inference
+- the async/sync bridge (sync chunk generator → async queue for streaming)
+
+The backend owns:
+- the actual library import (`transformers`, `faster_whisper`, `kokoro`, `piper`)
+- model resolution rules (HF repo / local path / curated voice id)
+- inference (sync, runs in the executor)
+- the voice / language catalog (used by the UI to build pickers)
+- capability flags via `supports("torch_compile" / "bf16" / "initial_prompt" / …)`
+
+### Currently shipped backends
+
+**STT** (registered in `backends/__init__.py`):
+  - **`whisper`** — `transformers.WhisperForConditionalGeneration` +
+    `AutoProcessor`. Broadest feature set (initial_prompt, torch.compile,
+    bf16, translate-to-EN). Default: `openai/whisper-base`.
+  - **`faster-whisper`** — `faster_whisper.WhisperModel` (CTranslate2).
+    ~4× faster on GPU, int8 mode on CPU. Same model checkpoints. Doesn't
+    support torch.compile (CT2 has its own kernels) or bf16 → those
+    rows show but are ignored by `supports()`.
+
+**TTS** (registered in `backends/__init__.py`):
+  - **`kokoro`** — `kokoro.KPipeline`. 54 voices across 9 lang_codes.
+    PyTorch, native per-sentence streaming. Default: `hexgrad/Kokoro-82M`.
+  - **`piper`** — `piper.PiperVoice` (ONNX-based). Curated list of ~20
+    voices in major languages, .onnx auto-downloaded to
+    `~/.cache/voxtype-piper/` on first use. Doesn't support
+    torch.compile (ONNX, not torch).
+
+### Adding a backend
+
+1. Create `voxtype/backends/<name>.py` subclassing the ABC.
+2. Add one `_register_*("<name>", "voxtype.backends.<name>", "<Class>")`
+   line in `backends/__init__.py`.
+3. Append the optional dep to `voxtype/requirements.txt`.
+
+Backends that fail to import (missing optional dep) are silently
+skipped by the registry — the UI just doesn't list them.
+
+### Engine API (unchanged by the backend split)
 
 ```python
 eng = stt_engine.get_engine()
-await eng.configure(settings)       # apply model_path / device / language
+await eng.configure(settings)       # picks backend + applies all knobs
 await eng.ensure_loaded()           # lazy on first request
 text = await eng.transcribe(pcm)
-await eng.unload()                  # release model, torch.cuda.empty_cache(), gc.collect
+await eng.unload()
 ```
-
-**STT** uses `transformers.WhisperForConditionalGeneration` +
-`AutoProcessor`. Default: `openai/whisper-base` (99 langs, ~145 MB).
-On GPU we load fp16 weights for ~2× speedup; CPU runs fp32.
-`generate()` is called with `language=` + `task=` directly (the
-deprecated `forced_decoder_ids` API was removed in transformers 4.40).
-
-**TTS** uses `kokoro.KPipeline` from the official `kokoro` PyPI
-package. Default: `hexgrad/Kokoro-82M` (54 voices, 9 language
-families). The pipeline picks the language from the voice name prefix
-at synthesise time, so we don't lock `lang_code` at init.
-Voice names are strings like `af_heart`, `am_adam`, `jm_kumo`,
-`zf_xiaoxiao` — encoded as `{lang}{gender}_{name}`.
 
 Each engine:
 - Accepts either a local path or a HF repo ID as the model setting.
@@ -175,10 +208,11 @@ class AppSettings:
     server_enabled: bool = True
     server_port: int = 6600
 
-    # STT (transformers + torch)
+    # STT (pluggable: whisper | faster-whisper)
     stt_enabled: bool = True
     stt_auto_start: bool = True
     stt_idle_unload_sec: int = 300
+    stt_backend: STTBackendName = "whisper"
     stt_model_path: str = "openai/whisper-base"
     stt_device: TorchDevice = "cpu"
     stt_language: str = "en"
@@ -189,10 +223,11 @@ class AppSettings:
     stt_warmup: bool = True                   # dummy infer after load
     stt_torch_compile: bool = False           # +20-40% steady-state
 
-    # TTS (kokoro + torch)
+    # TTS (pluggable: kokoro | piper)
     tts_enabled: bool = False
     tts_auto_start: bool = False
     tts_idle_unload_sec: int = 600
+    tts_backend: TTSBackendName = "kokoro"
     tts_model_path: str = "hexgrad/Kokoro-82M"
     tts_device: TorchDevice = "cpu"
     tts_speaker: str = "af_heart"

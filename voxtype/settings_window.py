@@ -668,7 +668,15 @@ def _build_services(window) -> QWidget:
     layout.addWidget(srv_card)
 
     # ── STT card ───────────────────────────────────────────────────
-    s_card, s_body = _card("STT", "speech-to-text · transformers + torch (Whisper)")
+    from voxtype.stt_engine import available_backends as _stt_backends_fn
+    _stt_backends = _stt_backends_fn() or ["whisper"]
+    s_card, s_body = _card("STT", "pluggable speech-to-text · whisper / faster-whisper")
+    s_body.addWidget(_row(_label("Backend",
+        "Engine library used for transcription.\n"
+        "  whisper        — HuggingFace transformers; broadest features.\n"
+        "  faster-whisper — CTranslate2; ~4× faster GPU, int8 CPU mode.\n"
+        "Both use Whisper-family checkpoints (openai/whisper-* etc.)."),
+        _combo("stt_backend", [(n, n) for n in _stt_backends])))
     s_body.addWidget(_row(_label("Enabled"),
         _checkbox("stt_enabled", "Run STT")))
     s_body.addWidget(_row(_label("Auto-Start On Boot",
@@ -742,7 +750,15 @@ def _build_services(window) -> QWidget:
     layout.addWidget(s_card)
 
     # ── TTS card ───────────────────────────────────────────────────
-    t_card, t_body = _card("TTS", "text-to-speech · kokoro + torch (Kokoro-82M)")
+    from voxtype.tts_engine import available_backends as _tts_backends_fn
+    _tts_backends = _tts_backends_fn() or ["kokoro"]
+    t_card, t_body = _card("TTS", "pluggable text-to-speech · kokoro / piper")
+    t_body.addWidget(_row(_label("Backend",
+        "Engine library used for synthesis.\n"
+        "  kokoro — 54 voices, 9 langs, ~327 MB, PyTorch.\n"
+        "  piper  — ~150 voices, 30+ langs, ~50 MB/voice, ONNX (CPU-fast).\n"
+        "After switching, reopen Settings to refresh the Voice list."),
+        _combo("tts_backend", [(n, n) for n in _tts_backends])))
     t_body.addWidget(_row(_label("Enabled"),
         _checkbox("tts_enabled", "Run TTS")))
     t_body.addWidget(_row(_label("Auto-Start On Boot"),
@@ -751,29 +767,35 @@ def _build_services(window) -> QWidget:
         "Unload the TTS model after N seconds of no synthesise calls. "
         "0 = never."),
         _spin_idle("tts_idle_unload_sec")))
-    from voxtype.tts_engine import DEFAULT_MODEL as _TTS_DEFAULT
+    from voxtype.tts_engine import default_model_for as _tts_default_model_for
+    _tts_active_backend = str(getattr(config.load(), "tts_backend", "kokoro") or "kokoro")
+    _TTS_DEFAULT = _tts_default_model_for(_tts_active_backend)
     t_body.addWidget(_row(_label("Model",
-        "HuggingFace repo ID. Default = `hexgrad/Kokoro-82M` (54 voices, "
-        "9 language families). Empty = use the built-in default shown as "
-        "placeholder."),
-        _model_row("tts_model_path", _TTS_DEFAULT, family="kokoro")))
+        "HuggingFace repo ID (Kokoro) or backend-specific identifier "
+        "(Piper). Empty = use the built-in default shown as placeholder."),
+        _model_row("tts_model_path", _TTS_DEFAULT,
+                    family=_tts_active_backend)))
     t_body.addWidget(_row(_label("Device",
         "Falls back to CPU automatically if torch.cuda.is_available() is False."),
         _combo("tts_device", [("cpu", "CPU"), ("cuda", "GPU (CUDA)")])))
     from voxtype.tts_engine import (
         voice_combo_options as _tts_voices,
         all_voice_ids as _tts_voice_ids,
-        DEFAULT_VOICE as _TTS_DEFAULT_VOICE,
+        default_voice_for as _tts_default_voice_for,
     )
-    # Migrate legacy values (e.g. "0" from the pre-PyTorch integer-speaker
-    # era) to the new default so the combo lands on a real voice.
-    if str(getattr(config.load(), "tts_speaker", "")) not in _tts_voice_ids():
-        config.patch("tts_speaker", _TTS_DEFAULT_VOICE)
+    # Migrate legacy / cross-backend voice values. If the current
+    # tts_speaker isn't in the active backend's catalog, snap to that
+    # backend's default voice.
+    _active_voice_ids = _tts_voice_ids(_tts_active_backend)
+    _active_default_voice = _tts_default_voice_for(_tts_active_backend)
+    if str(getattr(config.load(), "tts_speaker", "")) not in _active_voice_ids:
+        config.patch("tts_speaker", _active_default_voice)
     t_body.addWidget(_row(_label("Voice",
-        "Pick from Kokoro's 54 voices. The id prefix encodes language "
-        "and gender (a/b=Am/Br-En, e=es, f=fr, h=hi, i=it, j=ja, "
-        "p=pt-br, z=zh; second letter f=female, m=male)."),
-        _combo("tts_speaker", _tts_voices())))
+        "Backend-specific voice catalog. Kokoro: 54 voices across 9 "
+        "languages. Piper: ~150 voices across 30+ languages, curated to "
+        "the popular ones. Switch backend + reopen Settings to see "
+        "the other catalog."),
+        _combo("tts_speaker", _tts_voices(_tts_active_backend))))
     t_body.addWidget(_row(_label("Speed",
         "Synthesis rate. 1.0 = normal, >1 = faster, <1 = slower."),
         _slider_float("tts_length_scale", 0.5, 2.0, 0.05, suffix="x")))
